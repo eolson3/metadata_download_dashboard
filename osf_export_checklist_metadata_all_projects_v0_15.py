@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import getpass
 import html
 import json
@@ -53,7 +54,7 @@ WINDOWS_RESERVED_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
-INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]')
 VALID_ACTIONS = {
     "metadata",
     "wiki_current",
@@ -85,7 +86,6 @@ PROVIDER_LABELS = {
     "onedrive": "OneDrive",
     "owncloud": "ownCloud",
     "s3": "Amazon S3",
-    "swift": "OpenStack Swift",
     "zotero": "Zotero",
 }
 
@@ -242,6 +242,14 @@ def concise_issue_reason(error: Exception | str) -> str:
     if "no version-history link" in lower:
         return "OSF did not provide a wiki version-history link"
     if isinstance(error, OSError):
+        if (
+            error.errno == errno.ENAMETOOLONG
+            or getattr(error, "winerror", None) == 206
+        ):
+            return (
+                "the local export path exceeded the operating system's length "
+                "limit; retry using a shorter --output location"
+            )
         return "the local output file could not be written"
     first_sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
     return first_sentence[:240] or "an unknown error occurred"
@@ -459,22 +467,51 @@ def zip_download_url(url: str) -> str:
     )
 
 
+def truncate_utf8(value: str, max_bytes: int) -> str:
+    """Truncate text without splitting a UTF-8 character."""
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be at least 1")
+
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(" .")
+
+
 def safe_segment(value: str, max_length: int = 140) -> str:
+    if max_length < 1:
+        raise ValueError("max_length must be at least 1")
+
     value = unicodedata.normalize("NFC", str(value))
     value = INVALID_FILENAME_CHARS.sub(" - ", value)
     value = re.sub(r"\s+", " ", value).strip(" .")
+
     if not value:
         value = "Untitled"
-    if value.upper() in WINDOWS_RESERVED_NAMES:
-        value = f"_{value}"
-    if len(value) > max_length:
-        value = value[:max_length].rstrip(" .")
-    return value
+
+    value = value[:max_length].rstrip(" .")
+    value = truncate_utf8(value, max_length)
+
+    # Windows reserves device names even when they have extensions,
+    # including CON.txt, NUL.json, COM1.csv, and LPT1.zip.
+    windows_base_name = value.partition(".")[0].rstrip(" ").upper()
+    if windows_base_name in WINDOWS_RESERVED_NAMES:
+        value = truncate_utf8(f"_{value}", max_length)
+
+    return value or "Untitled"
 
 
-def title_guid_name(title: str, guid: str, max_length: int = 200) -> str:
+def title_guid_name(title: str, guid: str, max_length: int = 140) -> str:
+    """Combine a shortened title with its GUID within a byte limit."""
     suffix = f" [{guid}]"
-    safe_title = safe_segment(title, max_length=max(1, max_length - len(suffix)))
+    suffix_bytes = len(suffix.encode("utf-8"))
+    title_bytes = max_length - suffix_bytes
+
+    if title_bytes < 1:
+        raise ValueError("max_length is too small to retain the GUID")
+
+    safe_title = safe_segment(title, max_length=title_bytes)
     return f"{safe_title}{suffix}"
 
 
@@ -949,8 +986,23 @@ def action_output_folder(node: NodeRecord, action: str) -> Path:
     return folder
 
 
-def owner_prefixed_name(node: NodeRecord, suffix: str, max_length: int = 240) -> str:
-    return f"{title_guid_name(node.title, node.guid, max(20, max_length - len(suffix)))}{suffix}"
+def owner_prefixed_name(
+    node: NodeRecord,
+    suffix: str,
+    max_length: int = 220,
+) -> str:
+    """Create a filename that retains the owner GUID within a byte limit."""
+    suffix_bytes = len(suffix.encode("utf-8"))
+    guid_bytes = len(f" [{node.guid}]".encode("utf-8"))
+    minimum_title_bytes = 1
+
+    if suffix_bytes + guid_bytes + minimum_title_bytes > max_length:
+        raise ChecklistError(
+            "A generated filename suffix exceeded the portable filename limit."
+        )
+
+    owner_bytes = max_length - suffix_bytes
+    return f"{title_guid_name(node.title, node.guid, owner_bytes)}{suffix}"
 
 
 def check_cancel(job: ExportJob) -> None:
@@ -2024,8 +2076,11 @@ def write_export_summary(
     )
     summary_folder = action_output_folder(root, job.action)
     summary_folder.mkdir(parents=True, exist_ok=True)
-    path = summary_folder / f"{root.display_name} - {summary_label}.json"
-    critical_count = sum(1 for issue in issues if issue.severity == "critical")
+path = summary_folder / owner_prefixed_name(
+    root,
+    f" - {summary_label}.json",
+)    
+critical_count = sum(1 for issue in issues if issue.severity == "critical")
     omission_count = sum(1 for issue in issues if issue.severity == "omission")
     notes_by_action = {
         "metadata": [
