@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import shutil
@@ -344,7 +345,38 @@ class DashboardV015Tests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(checked.returncode, 0, checked.stderr)
+    def test_safe_segment_handles_cross_platform_filename_rules(self):
+        self.assertEqual(exporter.safe_segment("CON"), "_CON")
+        self.assertEqual(exporter.safe_segment("CON.txt"), "_CON.txt")
+        self.assertEqual(exporter.safe_segment("NUL.json"), "_NUL.json")
+        self.assertEqual(exporter.safe_segment("LPT1.zip"), "_LPT1.zip")
+        self.assertEqual(exporter.safe_segment(".."), "Untitled")
+        self.assertEqual(exporter.safe_segment("a/b\\c"), "a - b - c")
 
+        unicode_name = exporter.safe_segment("😀" * 200)
+        self.assertLessEqual(len(unicode_name.encode("utf-8")), 140)
+        self.assertFalse(unicode_name.endswith((" ", ".")))
+
+    def test_owner_prefixed_name_respects_byte_limit(self):
+        node = self.node()
+        node.title = "😀" * 200
+
+        filename = exporter.owner_prefixed_name(
+            node,
+            " - Complete Metadata.json",
+        )
+
+        self.assertLessEqual(len(filename.encode("utf-8")), 220)
+        self.assertIn("[abc12]", filename)
+        self.assertTrue(filename.endswith(" - Complete Metadata.json"))
+
+    def test_long_path_error_has_actionable_guidance(self):
+        error = OSError(errno.ENAMETOOLONG, "File name too long")
+        message = exporter.concise_issue_reason(error)
+
+        self.assertIn("path exceeded", message)
+        self.assertIn("--output", message)
+    
     def test_certificate_error_has_specific_guidance(self):
         ssl_error = urllib.error.URLError(
             "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
