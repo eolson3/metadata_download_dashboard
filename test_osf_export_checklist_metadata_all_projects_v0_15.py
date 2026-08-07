@@ -313,13 +313,14 @@ class DashboardV015Tests(unittest.TestCase):
         self.assertNotIn("Top-level export trees", page)
         self.assertNotIn("selectable export edition", page)
         self.assertIn("Version 0.15.0", page)
-        self.assertIn("Select all visible projects", page)
+        self.assertIn("Select all matching top-level projects", page)
         self.assertIn(
             'querySelectorAll(".node[data-root=true] > .node-row .batch-check")',
             page,
         )
         self.assertIn(
-            ".node[data-root=true]:not(.hidden) > .node-row .batch-check",
+            '.node[data-root="true"][data-filter-match="true"]:not(.hidden) > '
+            ".node-row .batch-check",
             page,
         )
         self.assertIn('data-action="files"', page)
