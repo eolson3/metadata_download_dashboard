@@ -373,13 +373,18 @@ def action_content_types(action: str) -> list[str]:
     return [action]
 
 
-def issue_content_type(issue: ExportIssue) -> str | None:
+def issue_content_type(issue: ExportIssue, action: str) -> str | None:
     element_type = issue.element_type.casefold()
     if element_type == "core metadata or primary requested content":
         return None
     if "wiki" in element_type:
-        if "version" in element_type:
+        if "version" in element_type or "history" in element_type:
             return "wiki_history"
+        if element_type == "wiki collection" and action in {
+            "wiki_current",
+            "wiki_history",
+        }:
+            return action
         return "wiki_current"
     if "activity-log" in element_type:
         return "logs"
@@ -410,7 +415,7 @@ def build_retry_plan(
     allowed = set(action_content_types(action))
     scopes: dict[str, set[str]] = {}
     for issue in issues:
-        content_type = issue_content_type(issue)
+        content_type = issue_content_type(issue, action)
         if not content_type or content_type not in allowed or not issue.project_guid:
             return {
                 "mode": "full",
@@ -616,6 +621,7 @@ class OSFClient:
         self.api_base = api_base.rstrip("/")
         self.token = token.strip()
         self.timeout = timeout
+        self.cancel_requested: Callable[[], bool] | None = None
         self._request_lock = threading.Lock()
         self._has_started_request = False
         api_host = urllib.parse.urlparse(self.api_base).hostname or ""
@@ -625,6 +631,15 @@ class OSFClient:
         )
 
     def api_url(self, path: str) -> str:
+            def wait(self, seconds: float) -> None:
+        """Wait between attempts while still responding to job cancellation."""
+        remaining = max(0.0, seconds)
+        while remaining > 0:
+            if self.cancel_requested and self.cancel_requested():
+                raise JobCancelled("Cancelled by user")
+            interval = min(1.0, remaining)
+            time.sleep(interval)
+            remaining -= interval
         return f"{self.api_base}/{path.lstrip('/')}"
 
     def headers(
@@ -662,7 +677,7 @@ class OSFClient:
 
         with self._request_lock:
             if self._has_started_request:
-                time.sleep(REQUEST_PAUSE_SECONDS)
+            self.wait(REQUEST_PAUSE_SECONDS)
             self._has_started_request = True
             return self.opener.open(request, timeout=self.timeout)
 
@@ -683,7 +698,7 @@ class OSFClient:
                 last_error = error
                 if error.code in RETRYABLE_HTTP_STATUSES and attempt < MAX_RETRIES - 1:
                     delay = retry_delay(error, attempt)
-                    time.sleep(delay)
+                    self.wait(delay)
                     continue
                 raise http_error(error) from error
             except (urllib.error.URLError, TimeoutError) as error:
@@ -692,7 +707,7 @@ class OSFClient:
                 if permanent is not None:
                     raise permanent from error
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(min(30.0, 2.0**attempt))
+                    time.wait(min(30.0, 2.0**attempt))
                     continue
                 raise ChecklistError(
                     "Could not reach OSF after several attempts. Check the internet "
@@ -736,7 +751,7 @@ class OSFClient:
                 last_error = error
                 temporary.unlink(missing_ok=True)
                 if error.code in RETRYABLE_HTTP_STATUSES and attempt < MAX_RETRIES - 1:
-                    time.sleep(retry_delay(error, attempt))
+                    time.wait(retry_delay(error, attempt))
                     continue
                 raise http_error(error) from error
             except (urllib.error.URLError, TimeoutError) as error:
@@ -746,7 +761,7 @@ class OSFClient:
                 if permanent is not None:
                     raise permanent from error
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(min(30.0, 2.0**attempt))
+                    time.wait(min(30.0, 2.0**attempt))
                     continue
                 raise ChecklistError(
                     "Could not reach the OSF file service after several attempts."
@@ -1355,7 +1370,128 @@ def metadata_records_html(source: dict[str, Any]) -> str:
         )
     return "".join(output)
 
-
+METADATA_CSS = r"""
+:root {
+  --ink: #243746;
+  --muted: #657985;
+  --line: #d8e2e7;
+  --blue: #1f608d;
+  --bg: #f4f7f9;
+  --paper: #fff;
+  --warn: #8a4b08;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.48 -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+}
+header {
+  padding: 28px max(22px, calc((100% - 1040px) / 2));
+  color: #fff;
+  background: linear-gradient(135deg, #243746, #2c6e9f);
+}
+header h1 {
+  margin: 0 0 5px;
+  font-size: 1.8rem;
+}
+header p {
+  margin: 0;
+  opacity: 0.88;
+}
+main {
+  width: min(1040px, calc(100% - 30px));
+  margin: 20px auto 60px;
+}
+section {
+  margin: 0 0 16px;
+  padding: 18px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  box-shadow: 0 3px 12px rgba(20, 45, 60, 0.05);
+}
+h2 {
+  margin: 0 0 11px;
+  font-size: 1.18rem;
+}
+a {
+  color: var(--blue);
+  overflow-wrap: anywhere;
+}
+.metadata-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.metadata-table th,
+.metadata-table td {
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+.metadata-table th {
+  width: 25%;
+  background: #f5f8fa;
+}
+.metadata-table.nested th {
+  width: 28%;
+  font-size: 0.84rem;
+}
+.metadata-list {
+  margin: 0;
+  padding-left: 21px;
+}
+.metadata-list > li {
+  margin: 4px 0;
+}
+.record {
+  margin: 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.record summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  font-weight: 700;
+  background: #f6f9fa;
+}
+.record > .metadata-table {
+  width: calc(100% - 16px);
+  margin: 8px;
+}
+.empty-value,
+.source,
+footer {
+  color: var(--muted);
+}
+.source {
+  font-size: 0.78rem;
+}
+.warning {
+  color: var(--warn);
+}
+.text-value,
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+pre {
+  font-size: 0.78rem;
+}
+footer {
+  text-align: center;
+  font-size: 0.78rem;
+}
+@media (max-width: 650px) {
+  .metadata-table th {
+    width: 35%;
+  }
+}
+""".strip()
 def render_complete_metadata_html(package: dict[str, Any]) -> str:
     project = package.get("project") or {}
     title = str(project.get("title") or "Untitled OSF project")
@@ -1383,7 +1519,7 @@ def render_complete_metadata_html(package: dict[str, Any]) -> str:
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
 <title>{html.escape(title)} [{html.escape(guid)}] - Complete Metadata</title>
 <style>
-{DASHBOARD_CSS}
+{METADATA_CSS}
 </style>
 </head><body>
 <header><h1>{html.escape(title)} [{html.escape(guid)}]</h1><p>Complete OSF metadata export · {html.escape(str(package.get("exported_utc") or ""))}</p></header>
@@ -2490,7 +2626,8 @@ def export_file_archives(
     span: float,
 ) -> tuple[int, int]:
     """Download one ZIP per configured storage provider into the node tree."""
-    archives: list[tuple[NodeRecord, str, str, str]] = []
+        archives: list[tuple[NodeRecord, str, str, str]] = []
+    expected_by_node: dict[str, int] = {}
     node_count = max(1, len(nodes))
     discovery_span = span * 0.15
     for index, node in enumerate(nodes):
@@ -2505,10 +2642,16 @@ def export_file_archives(
             records = list(client.paginate(files_url))
         except ChecklistError as error:
             add_issue(
-                issues, node, "file-storage provider collection", node.guid, error
+                issues,
+                node,
+                "file-storage provider collection",
+                node.guid,
+                error,
+                critical=True,
             )
             continue
         for record in records:
+            expected_by_node[node.guid] = expected_by_node.get(node.guid, 0) + 1
             provider, label, download_url = provider_archive_details(record)
             if not download_url:
                 add_issue(
@@ -2523,6 +2666,7 @@ def export_file_archives(
 
     archive_count = 0
     total_bytes = 0
+    succeeded_by_node: dict[str, int] = {}
     download_span = span - discovery_span
     archive_total = max(1, len(archives))
     
@@ -2550,10 +2694,24 @@ def export_file_archives(
             )
             archive_count += 1
             total_bytes += size
+            succeeded_by_node[node.guid] = (
+                succeeded_by_node.get(node.guid, 0) + 1
+            )
             node.file_archive_count += 1
             node.file_archive_bytes += size
         except (ChecklistError, OSError) as error:
             add_issue(issues, node, "file ZIP archive", provider, error)
+    for node in nodes:
+        expected = expected_by_node.get(node.guid, 0)
+        if expected and succeeded_by_node.get(node.guid, 0) == 0:
+            add_issue(
+                issues,
+                node,
+                "file ZIP export",
+                node.guid,
+                "No storage-provider ZIP archive could be downloaded",
+                critical=True,
+            )
     report(start + span, "File ZIP downloads finished")
     return archive_count, total_bytes
 
@@ -2581,19 +2739,19 @@ def write_export_summary(
         if job.retry_of
         else f"{action_title(job.action)} Export Summary"
     )
-        summary_folder = action_output_folder(root, job.action)
-        summary_folder.mkdir(parents=True, exist_ok=True)
+    summary_folder = action_output_folder(root, job.action)
+    summary_folder.mkdir(parents=True, exist_ok=True)
 
-        path = summary_folder / owner_prefixed_name(
-            root,
-            f" - {summary_label}.json",
-        )    
-        critical_count = sum(
-            1 for issue in issues if issue.severity == "critical"
-        )
-        omission_count = sum(
-            1 for issue in issues if issue.severity == "omission"
-        )
+    path = summary_folder / owner_prefixed_name(
+        root,
+        f" - {summary_label}.json",
+    )
+    critical_count = sum(
+        1 for issue in issues if issue.severity == "critical"
+    )
+    omission_count = sum(
+        1 for issue in issues if issue.severity == "omission"
+    )
     notes_by_action = {
         "metadata": [
             "Each Metadata folder contains readable comprehensive HTML and JSON.",
@@ -2881,6 +3039,7 @@ class ChecklistApp:
             "file_zip_archives": 0,
             "file_zip_bytes": 0,
         }
+                self.client.cancel_requested = lambda: job.cancel_requested
         try:
             root = discover_tree(self.client, job.root_guid)
             nodes = flatten_tree(root)
@@ -3042,11 +3201,13 @@ class ChecklistApp:
         except JobCancelled:
             with self.lock:
                 job.status = "cancelled"
-                job.message = "Cancelled. Completed outputs are retained and a retry can continue."
+                job.message = (
+                    "Cancelled. Completed outputs are retained and a retry can continue."
+                )
                 job.finished_at = utc_now()
                 job.issues = issues
+
         # Keep the worker thread alive if an unexpected export defect occurs.
-        # The exception is converted into a visible failed job with diagnostics.
         except Exception as error:
             fallback_root = self.root_map[job.root_guid]
             add_issue(
@@ -3066,7 +3227,8 @@ class ChecklistApp:
                 job.finished_at = utc_now()
                 job.issues = issues
 
-
+        finally:
+            self.client.cancel_requested = None
 def flatten_for_csv(
     nodes: list[NodeRecord], depth: int = 0, parent_guid: str = ""
 ) -> list[dict[str, Any]]:
@@ -3626,8 +3788,8 @@ __DASHBOARD_CSS__
     <div class="progress"><span id="progressText">0 reviewed</span><i><b id="progressFill"></b></i></div>
   </section>
   <section class="batch-panel">
-    <h2>Batch export</h2><p class="muted">Select “Include in batch” on one or more top-level projects, check the content to export, then run the batch. Filters control which projects are included by “Select all visible projects.”</p>
-    <div class="batch-buttons"><button id="selectAllBatch" type="button">Select all visible projects</button><button id="clearBatch" type="button">Clear batch selection</button></div>
+    <h2>Batch export</h2><p class="muted">Select “Include in batch” on one or more top-level projects, check the content to export, then run the batch. Filters control which projects are included by “Select all matching top-level projects.” A parent shown only to provide context for a matching component is not selected.</p>
+    <div class="batch-buttons"><button id="selectAllBatch" type="button">Select all matching top-level projects</button><button id="clearBatch" type="button">Clear batch selection</button></div>
     <div class="export-choices">
       <label class="export-choice"><input type="checkbox" name="batchAction" value="metadata"><span><strong>Comprehensive metadata</strong><small>Per-item readable HTML and comprehensive JSON, including CEDAR/custom metadata and resolved relationships.</small></span></label>
       <label class="export-choice"><input type="checkbox" name="batchAction" value="wiki_current"><span><strong>Current wikis</strong><small>The most recent content of every wiki page.</small></span></label>
@@ -3705,6 +3867,17 @@ __DASHBOARD_CSS__
           permission.value === node.dataset.permission) &&
         (completion.value === "all" ||
           completion.value === (reviewed ? "checked" : "unchecked"));
+           node.dataset.filterMatch = own ? "true" : "false";
+
+      if (node.dataset.root === "true") {
+        const batchCheck = node.querySelector(
+          ":scope > .node-row .batch-check",
+        );
+        if (batchCheck) {
+          batchCheck.disabled = !own;
+          if (!own) batchCheck.checked = false;
+        }
+      }
       const show = own || childVisible;
       node.classList.toggle("hidden", !show);
       if (childVisible && (query || permission.value !== "all"))
@@ -3715,10 +3888,12 @@ __DASHBOARD_CSS__
       .querySelectorAll(".tree")
       .forEach((tree) => [...tree.children].forEach(evaluate));
     const visibleRoots = [
-      ...document.querySelectorAll(".node[data-root=true]:not(.hidden)"),
+      ...document.querySelectorAll(
+        '.node[data-root="true"][data-filter-match="true"]:not(.hidden)',
+      ),
     ].length;
     document.getElementById("selectAllBatch").textContent =
-      `Select all visible projects (${visibleRoots.toLocaleString()})`;
+      `Select all matching top-level projects (${visibleRoots.toLocaleString()})`;
   }
   nodeChecks.forEach((check) => {
     const guid = check.closest(".node").dataset.guid;
@@ -3772,7 +3947,7 @@ __DASHBOARD_CSS__
     }
     try {
       await api("/api/jobs", { guids, action });
-      await poll();
+      await refreshJobs();
     } catch (error) {
       alert(error.message);
     }
@@ -3803,7 +3978,7 @@ __DASHBOARD_CSS__
     }
     try {
       await api("/api/jobs", { guids, actions });
-      await poll();
+      await refreshJobs();
     } catch (error) {
       alert(error.message);
     }
@@ -3814,8 +3989,7 @@ __DASHBOARD_CSS__
       .forEach((check) => (check.checked = false));
     document
       .querySelectorAll(
-        ".node[data-root=true]:not(.hidden) > .node-row .batch-check",
-      )
+        '.node[data-root="true"][data-filter-match="true"]:not(.hidden) > .node-row .batch-check',      )
       .forEach((check) => (check.checked = true));
   };
   document.getElementById("clearBatch").onclick = () => {
@@ -3885,14 +4059,14 @@ __DASHBOARD_CSS__
       (button) =>
         (button.onclick = () =>
           api(`/api/jobs/${button.dataset.cancel}/cancel`, {})
-            .then(poll)
+            .then(refreshJobs)
             .catch((error) => alert(error.message))),
     );
     area.querySelectorAll("[data-retry]").forEach(
       (button) =>
         (button.onclick = () =>
           api(`/api/jobs/${button.dataset.retry}/retry`, {})
-            .then(poll)
+            .then(refreshJobs)
             .catch((error) => alert(error.message))),
     );
     area
@@ -3905,7 +4079,7 @@ __DASHBOARD_CSS__
             )),
       );
   }
-  async function poll() {
+  async function refreshJobs() {
     try {
       const response = await fetch("/api/state", { cache: "no-store" }),
         data = await response.json();
@@ -3913,6 +4087,10 @@ __DASHBOARD_CSS__
     } catch (error) {
       console.warn("Could not refresh checklist state.", error);
     }
+  }
+
+  async function poll() {
+    await refreshJobs();
     setTimeout(poll, 1500);
   }
   function csvEscape(value) {
@@ -3963,18 +4141,16 @@ __DASHBOARD_CSS__
 })();
 </script>
 </body></html>"""
-    # Replace executable/data placeholders before inserting user-supplied HTML.
-    # This prevents a project title that resembles a marker from being treated
-    # as a second template placeholder.
-    user_content_markers = {"__ACCOUNT__", "__NODE_HTML__", "__OUTPUT_BASE__"}
-    for marker, value in replacements.items():
-        if marker not in user_content_markers:
-            template = template.replace(marker, value)
-    for marker in ("__ACCOUNT__", "__NODE_HTML__", "__OUTPUT_BASE__"):
-        value = replacements[marker]
-        template = template.replace(marker, value)
-    return template
-
+    marker_pattern = re.compile(
+        "|".join(
+            re.escape(marker)
+            for marker in sorted(replacements, key=len, reverse=True)
+        )
+    )
+    return marker_pattern.sub(
+        lambda match: replacements[match.group(0)],
+        template,
+    )
 
 def normalize_job_request(
     body: dict[str, Any], available_guids: Iterable[str]
@@ -4254,10 +4430,20 @@ def main(argv: list[str] | None = None) -> int:
     if not 0 <= args.port <= 65535:
         raise ChecklistError("--port must be between 0 and 65535.")
     token = get_token(args.token)
-    explicit_test_url = any(
-        urllib.parse.urlparse(value if "://" in value else "").hostname == "test.osf.io"
+    project_hosts = {
+        urllib.parse.urlparse(
+            value if "://" in value else f"https://{value}"
+        ).hostname
         for value in args.project
-    )
+        if "/" in value or "." in value
+    }
+
+    if "test.osf.io" in project_hosts and "osf.io" in project_hosts:
+        raise ChecklistError(
+            "Do not mix production and test OSF project URLs in one checklist."
+        )
+
+    explicit_test_url = "test.osf.io" in project_hosts
     api_base = TEST_API if args.test or explicit_test_url else PRODUCTION_API
     client = OSFClient(api_base, token)
     print("Checking OSF account...", flush=True)
