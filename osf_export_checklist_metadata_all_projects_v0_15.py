@@ -7,6 +7,7 @@ and preserves the OSF project/component hierarchy in every export.
 """
 
 from __future__ import annotations
+from email.utils import parsedate_to_datetime
 
 import argparse
 import csv
@@ -39,10 +40,15 @@ from typing import Any, Callable, Iterable
 
 PRODUCTION_API = "https://api.osf.io/v2"
 TEST_API = "https://api.test.osf.io/v2"
+JSONAPI_MEDIA_TYPE = "application/vnd.api+json"
 SCRIPT_VERSION = "0.15.0"
-PAGE_SIZE = 100
+PAGE_SIZE = 10
 REQUEST_TIMEOUT = 90
+REQUEST_PAUSE_SECONDS = 0.5
 MAX_RETRIES = 6
+MIN_MAINTENANCE_RETRY_SECONDS = 5 * 60
+FILE_ARCHIVE_PAUSE_SECONDS = 2.0
+OSF_STATUS_URL = "https://status.cos.io/"
 RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 USER_AGENT = f"OSF-Export-Checklist/{SCRIPT_VERSION}"
 
@@ -217,6 +223,13 @@ class ExportJob:
 
 def concise_issue_reason(error: Exception | str) -> str:
     text = re.sub(r"\s+", " ", str(error)).strip()
+    lower = text.casefold()
+
+    if "osf is undergoing maintenance" in lower:
+        return (
+            "OSF is undergoing maintenance; try again in a few minutes"
+        )
+
     status = re.search(r"HTTP\s+(\d{3})", text, re.I)
     if status:
         code = status.group(1)
@@ -232,7 +245,6 @@ def concise_issue_reason(error: Exception | str) -> str:
             "504": "OSF continued returning a gateway timeout after automatic retries (HTTP 504)",
         }
         return labels.get(code, f"OSF returned HTTP {code}")
-    lower = text.casefold()
     if "could not reach osf after several attempts" in lower:
         return "OSF could not be reached after automatic retries"
     if "no current-content download link" in lower:
@@ -544,13 +556,26 @@ def relationship_id(relationship: dict[str, Any] | None) -> str | None:
     return None
 
 
-def add_page_size(url: str, size: int = PAGE_SIZE) -> str:
+def add_page_size(
+    url: str,
+    size: int = PAGE_SIZE,
+    default_sort: str | None = None,
+) -> str:
     parsed = urllib.parse.urlparse(url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+
     if not any(key == "page[size]" for key, _ in query):
         query.append(("page[size]", str(size)))
-    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
 
+    if (
+        default_sort is not None
+        and not any(key == "sort" for key, _ in query)
+    ):
+        query.append(("sort", default_sort))
+
+    return urllib.parse.urlunparse(
+        parsed._replace(query=urllib.parse.urlencode(query))
+    )
 
 def extract_guid(value: str) -> str:
     value = value.strip()
@@ -588,10 +613,12 @@ class OSFClient:
     def __init__(
         self, api_base: str, token: str, timeout: int = REQUEST_TIMEOUT
     ) -> None:
-        self.api_base = api_base.rstrip("/")
-        self.token = token.strip()
-        self.timeout = timeout
-        api_host = urllib.parse.urlparse(self.api_base).hostname or ""
+       self.api_base = api_base.rstrip("/")
+self.token = token.strip()
+self.timeout = timeout
+self._request_lock = threading.Lock()
+self._has_started_request = False
+api_host = urllib.parse.urlparse(self.api_base).hostname or ""
         self.trusted_hosts = {api_host}
         self.opener = urllib.request.build_opener(
             SafeRedirectHandler(self.trusted_hosts)
@@ -623,15 +650,20 @@ class OSFClient:
             f"OSF returned an unexpected file-download host: {host or 'missing host'}"
         )
 
-    def open(
-        self,
-        url: str,
-        accept: str = "application/vnd.api+json",
-        extra: dict[str, str] | None = None,
-    ):
-        headers = self.headers(url, accept)
-        headers.update(extra or {})
-        request = urllib.request.Request(url, headers=headers, method="GET")
+def open(
+    self,
+    url: str,
+    accept: str = "application/vnd.api+json",
+    extra: dict[str, str] | None = None,
+):
+    headers = self.headers(url, accept)
+    headers.update(extra or {})
+    request = urllib.request.Request(url, headers=headers, method="GET")
+
+    with self._request_lock:
+        if self._has_started_request:
+            time.sleep(REQUEST_PAUSE_SECONDS)
+        self._has_started_request = True
         return self.opener.open(request, timeout=self.timeout)
 
     def request_bytes(
@@ -765,37 +797,130 @@ class OSFClient:
             raise ChecklistError(f"OSF returned no response for {url}")
         return raw.decode("utf-8", errors="replace")
 
-    def paginate(self, url: str) -> Iterable[dict[str, Any]]:
-        next_url: str | None = add_page_size(url)
-        seen: set[str] = set()
-        while next_url:
-            if next_url in seen:
-                raise ChecklistError(f"OSF repeated a pagination link: {next_url}")
-            seen.add(next_url)
-            document = self.get_json(next_url)
-            data = document.get("data", [])
-            if isinstance(data, dict):
-                data = [data]
-            if not isinstance(data, list):
-                raise ChecklistError(f"Unexpected paginated response for {next_url}")
-            for item in data:
-                if isinstance(item, dict):
-                    yield item
-            next_value = (document.get("links") or {}).get("next")
-            if isinstance(next_value, dict):
-                next_value = next_value.get("href")
-            next_url = (
-                next_value if isinstance(next_value, str) and next_value else None
+def paginate(
+    self,
+    url: str,
+    *,
+    default_sort: str | None = None,
+) -> Iterable[dict[str, Any]]:
+    next_url: str | None = add_page_size(
+        url,
+        default_sort=default_sort,
+    )
+    seen: set[str] = set()
+
+    while next_url:
+        if next_url in seen:
+            raise ChecklistError(f"OSF repeated a pagination link: {next_url}")
+
+        seen.add(next_url)
+        document = self.get_json(next_url)
+        data = document.get("data", [])
+
+        if isinstance(data, dict):
+            data = [data]
+
+        if not isinstance(data, list):
+            raise ChecklistError(
+                f"Unexpected paginated response for {next_url}"
             )
+
+        for item in data:
+            if isinstance(item, dict):
+                yield item
+
+        next_value = (document.get("links") or {}).get("next")
+        if isinstance(next_value, dict):
+            next_value = next_value.get("href")
+
+        next_url = (
+            add_page_size(
+                next_value,
+                default_sort=default_sort,
+            )
+            if isinstance(next_value, str) and next_value
+            else None
+        )
+
+def http_error_body(error: urllib.error.HTTPError) -> bytes:
+    """Read an HTTP error body once and retain it for later classification."""
+    cached = getattr(error, "_osf_response_body", None)
+    if isinstance(cached, bytes):
+        return cached
+
+    try:
+        body = error.read()
+    except Exception:
+        body = b""
+
+    setattr(error, "_osf_response_body", body)
+    return body
+
+
+def osf_maintenance_mode(error: urllib.error.HTTPError) -> bool:
+    """Return whether OSF identified this 503 as maintenance mode."""
+    if error.code != 503:
+        return False
+
+    body = http_error_body(error)
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    if not isinstance(document, dict):
+        return False
+
+    meta = document.get("meta")
+    return (
+        isinstance(meta, dict)
+        and meta.get("maintenance_mode") is True
+    )
+
+
+def retry_after_delay(
+    error: urllib.error.HTTPError,
+) -> float | None:
+    """Return OSF's requested retry delay, if it supplied a valid value."""
+    retry_after = error.headers.get("Retry-After") if error.headers else None
+    if not retry_after:
+        return None
+
+    # Retry-After may specify a number of seconds.
+    try:
+        delay = float(retry_after)
+        if 0 <= delay < float("inf"):
+            return delay
+    except ValueError:
+        pass
+
+    # Retry-After may instead specify an HTTP date.
+    try:
+        retry_at = parsedate_to_datetime(retry_after)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+
+        return max(
+            0.0,
+            (retry_at - datetime.now(timezone.utc)).total_seconds(),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def retry_delay(error: urllib.error.HTTPError, attempt: int) -> float:
-    retry_after = error.headers.get("Retry-After") if error.headers else None
-    try:
-        return min(30.0, max(1.0, float(retry_after)))
-    except (TypeError, ValueError):
-        return min(30.0, 2.0**attempt)
+    instructed_delay = retry_after_delay(error)
 
+    if osf_maintenance_mode(error):
+        return max(
+            float(MIN_MAINTENANCE_RETRY_SECONDS),
+            instructed_delay if instructed_delay is not None else 0.0,
+        )
+
+    if instructed_delay is not None:
+        return instructed_delay
+
+    return 2.0**attempt
 
 def connection_error(error: BaseException) -> ChecklistError | None:
     """Classify permanent local TLS/DNS failures; return None when retrying may help."""
@@ -825,10 +950,15 @@ def connection_error(error: BaseException) -> ChecklistError | None:
 
 
 def http_error(error: urllib.error.HTTPError) -> ChecklistError:
-    try:
-        body = error.read().decode("utf-8", errors="replace")[:800]
-    except Exception:
-        body = ""
+    body_bytes = http_error_body(error)
+    body = body_bytes.decode("utf-8", errors="replace")[:800]
+
+    if osf_maintenance_mode(error):
+        return ChecklistError(
+            "OSF is undergoing maintenance. Try again in a few minutes. "
+            f"Check the OSF status page: {OSF_STATUS_URL}"
+        )
+
     if error.code == 401:
         message = (
             "OSF rejected the personal access token (HTTP 401). Copy a current token "
@@ -836,15 +966,19 @@ def http_error(error: urllib.error.HTTPError) -> ChecklistError:
             "OSF_TOKEN environment variable is set, clear or update it before trying again."
         )
     elif error.code == 403:
-        message = "OSF denied access (HTTP 403). Confirm that the token can view this content."
+        message = (
+            "OSF denied access (HTTP 403). Confirm that the token can view "
+            "this content."
+        )
     elif error.code == 404:
         message = "OSF could not find this project or resource (HTTP 404)."
     else:
         message = f"OSF request failed with HTTP {error.code}."
+
     if body:
         message += f" Response: {body}"
-    return ChecklistError(message)
 
+    return ChecklistError(message)
 
 def node_from_api(record: dict[str, Any], parent_guid: str | None = None) -> NodeRecord:
     guid = str(record.get("id") or "").strip().lower()
@@ -887,8 +1021,11 @@ def get_inventory(client: OSFClient) -> list[dict[str, Any]]:
         f"users/me/nodes/?{urllib.parse.urlencode({'page[size]': PAGE_SIZE})}"
     )
     records: list[dict[str, Any]] = []
-    for record in client.paginate(url):
-        records.append(record)
+for record in client.paginate(
+    url,
+    default_sort="-date_modified",
+):
+    records.append(record)
         if len(records) % 100 == 0:
             print(f"Retrieved {len(records):,} projects/components...", flush=True)
     return records
@@ -896,10 +1033,19 @@ def get_inventory(client: OSFClient) -> list[dict[str, Any]]:
 
 def build_hierarchy(
     records: list[dict[str, Any]],
+    forced_root_guids: set[str] | None = None,
 ) -> tuple[list[NodeRecord], list[NodeRecord]]:
+    forced_root_guids = {
+        guid.casefold() for guid in (forced_root_guids or set())
+    }
+
     nodes: dict[str, NodeRecord] = {}
     for record in records:
         node = node_from_api(record)
+
+        if node.guid in forced_root_guids:
+            node.parent_guid = None
+
         nodes[node.guid] = node
     roots: list[NodeRecord] = []
     orphans: list[NodeRecord] = []
@@ -928,31 +1074,92 @@ def build_hierarchy(
 
 
 def discover_tree(client: OSFClient, root_guid: str) -> NodeRecord:
-    data = client.get_json(client.api_url(f"nodes/{root_guid}/")).get("data")
-    if not isinstance(data, dict):
-        raise ChecklistError("OSF returned an unexpected project response.")
-    visited: set[str] = set()
+    """Retrieve a complete OSF subtree and reconstruct its hierarchy locally."""
+    root_guid = root_guid.casefold()
 
-    def visit(record: dict[str, Any], parent_guid: str | None) -> NodeRecord:
-        node = node_from_api(record, parent_guid)
-        if node.guid in visited:
-            raise ChecklistError(f"The OSF hierarchy repeated GUID {node.guid}.")
-        visited.add(node.guid)
-        children_url = related_href((record.get("relationships") or {}).get("children"))
-        if not children_url:
-            children_url = client.api_url(f"nodes/{node.guid}/children/")
-        children = list(client.paginate(children_url))
-        children.sort(
-            key=lambda item: (
-                clean_title((item.get("attributes") or {}).get("title"), "").casefold(),
-                str(item.get("id") or ""),
+    query = urllib.parse.urlencode(
+        {
+            "filter[root]": root_guid,
+            "page[size]": PAGE_SIZE,
+        }
+    )
+    tree_url = client.api_url(f"nodes/?{query}")
+    records = list(client.paginate(tree_url))
+
+    seen_guids: set[str] = set()
+    for record in records:
+        guid = str(record.get("id") or "").strip().casefold()
+        if not guid:
+            raise ChecklistError(
+                "An OSF hierarchy response did not include a node GUID."
             )
-        )
-        for child in children:
-            node.children.append(visit(child, node.guid))
-        return node
+        if guid in seen_guids:
+            raise ChecklistError(
+                f"OSF repeated node GUID {guid} while retrieving the hierarchy."
+            )
+        seen_guids.add(guid)
 
-    return visit(data, None)
+    # The filtered endpoint normally includes the requested root. Retain a
+    # fallback so a change in API behavior does not make the export unusable.
+    if root_guid not in seen_guids:
+        root_data = client.get_json(
+            client.api_url(f"nodes/{root_guid}/")
+        ).get("data")
+
+        if not isinstance(root_data, dict):
+            raise ChecklistError(
+                "OSF returned an unexpected project response."
+            )
+
+        records.insert(0, root_data)
+        seen_guids.add(root_guid)
+
+    roots, orphans = build_hierarchy(
+        records,
+        forced_root_guids={root_guid},
+    )
+
+    root = next(
+        (node for node in roots if node.guid == root_guid),
+        None,
+    )
+    if root is None:
+        raise ChecklistError(
+            f"OSF did not return the requested hierarchy root {root_guid}."
+        )
+
+    unexpected_roots = [
+        node for node in roots if node.guid != root_guid
+    ]
+    unattached = [*orphans, *unexpected_roots]
+    if unattached:
+        unattached_guids = sorted(node.guid for node in unattached)
+        displayed_guids = ", ".join(unattached_guids[:10])
+        if len(unattached_guids) > 10:
+            displayed_guids += f", and {len(unattached_guids) - 10} more"
+
+        raise ChecklistError(
+            "OSF returned projects/components that could not be connected "
+            f"to the requested hierarchy: {displayed_guids}"
+        )
+
+    connected_guids = {
+        node.guid for node in flatten_tree(root)
+    }
+    disconnected_guids = sorted(seen_guids - connected_guids)
+    if disconnected_guids:
+        displayed_guids = ", ".join(disconnected_guids[:10])
+        if len(disconnected_guids) > 10:
+            displayed_guids += (
+                f", and {len(disconnected_guids) - 10} more"
+            )
+
+        raise ChecklistError(
+            "OSF returned a disconnected or cyclic project hierarchy "
+            f"involving: {displayed_guids}"
+        )
+
+    return root
 
 
 def flatten_tree(root: NodeRecord) -> list[NodeRecord]:
@@ -1171,19 +1378,9 @@ def render_complete_metadata_html(package: dict[str, Any]) -> str:
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
 <title>{html.escape(title)} [{html.escape(guid)}] - Complete Metadata</title>
 <style>
-:root{{--ink:#243746;--muted:#657985;--line:#d8e2e7;--blue:#1f608d;--bg:#f4f7f9;--paper:#fff;--warn:#8a4b08}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.48 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}}
-header{{padding:28px max(22px,calc((100% - 1040px)/2));color:#fff;background:linear-gradient(135deg,#243746,#2c6e9f)}}
-header h1{{margin:0 0 5px;font-size:1.8rem}}header p{{margin:0;opacity:.88}}main{{width:min(1040px,calc(100% - 30px));margin:20px auto 60px}}
-section{{margin:0 0 16px;padding:18px;background:var(--paper);border:1px solid var(--line);border-radius:9px;box-shadow:0 3px 12px rgba(20,45,60,.05)}}
-h2{{margin:0 0 11px;font-size:1.18rem}}a{{color:var(--blue);overflow-wrap:anywhere}}.metadata-table{{width:100%;border-collapse:collapse}}
-.metadata-table th,.metadata-table td{{padding:7px 9px;border:1px solid var(--line);text-align:left;vertical-align:top}}.metadata-table th{{width:25%;background:#f5f8fa}}
-.metadata-table.nested th{{width:28%;font-size:.84rem}}.metadata-list{{margin:0;padding-left:21px}}.metadata-list>li{{margin:4px 0}}
-.record{{margin:8px 0;border:1px solid var(--line);border-radius:6px}}.record summary{{padding:8px 10px;cursor:pointer;font-weight:700;background:#f6f9fa}}
-.record>.metadata-table{{margin:8px;width:calc(100% - 16px)}}.empty-value,.source,footer{{color:var(--muted)}}.source{{font-size:.78rem}}
-.warning{{color:var(--warn)}}.text-value{{white-space:pre-wrap;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.78rem}}
-footer{{text-align:center;font-size:.78rem}}@media(max-width:650px){{.metadata-table th{{width:35%}}}}
-</style></head><body>
+__DASHBOARD_CSS__
+</style>
+</head><body>
 <header><h1>{html.escape(title)} [{html.escape(guid)}]</h1><p>Complete OSF metadata export · {html.escape(str(package.get("exported_utc") or ""))}</p></header>
 <main>
 <section><h2>Project or component</h2>{metadata_html_value(project)}</section>
@@ -1593,6 +1790,314 @@ def write_wiki_history_metadata(
         handle.write("\n")
 
 
+def get_node_wikis(
+    client: OSFClient,
+    node: NodeRecord,
+    issues: list[ExportIssue],
+) -> list[dict[str, Any]] | None:
+    """Retrieve and sort the wiki pages belonging to one node."""
+    relationships = node.raw.get("relationships") or {}
+    wikis_url = related_href(relationships.get("wikis")) or client.api_url(
+        f"nodes/{node.guid}/wikis/"
+    )
+
+    try:
+        wikis = list(client.paginate(wikis_url))
+    except ChecklistError as error:
+        add_issue(
+            issues,
+            node,
+            "wiki collection",
+            node.guid,
+            error,
+            critical=True,
+        )
+        return None
+
+    wikis.sort(
+        key=lambda item: wiki_page_details(item)[0].casefold()
+    )
+    return wikis
+
+
+def export_current_wiki_page(
+    client: OSFClient,
+    node: NodeRecord,
+    wiki: dict[str, Any],
+    issues: list[ExportIssue],
+) -> bool:
+    """Export the most recent content of one wiki page."""
+    _, wiki_id = wiki_page_details(wiki)
+    download_url = link_href(
+        (wiki.get("links") or {}).get("download")
+    )
+
+    if not download_url and wiki_id != "unknown":
+        download_url = client.api_url(
+            f"wikis/{wiki_id}/content/"
+        )
+
+    try:
+        if not isinstance(download_url, str) or not download_url:
+            raise ChecklistError(
+                "No current-content download link was provided"
+            )
+
+        content = client.get_text(download_url)
+        assert node.folder is not None
+
+        destination = (
+            action_output_folder(node, "wiki_current")
+            / wiki_filename(node, wiki)
+        )
+        destination.write_text(content, encoding="utf-8")
+
+        node.wiki_count += 1
+        return True
+    except (ChecklistError, OSError) as error:
+        add_issue(
+            issues,
+            node,
+            "current wiki page",
+            wiki_id,
+            error,
+        )
+        return False
+
+
+def export_one_wiki_version(
+    client: OSFClient,
+    node: NodeRecord,
+    wiki: dict[str, Any],
+    version: dict[str, Any],
+    width: int,
+    fallback: int,
+    history_folder: Path,
+    issues: list[ExportIssue],
+) -> dict[str, Any]:
+    """Export one historical wiki version and return its index row."""
+    _, wiki_id = wiki_page_details(wiki)
+    version_id = str(version.get("id") or fallback)
+    filename = wiki_version_filename(
+        node,
+        wiki,
+        version,
+        width,
+        fallback,
+    )
+
+    version_url = link_href(
+        (version.get("links") or {}).get("download")
+    )
+    if not version_url and wiki_id != "unknown":
+        version_url = client.api_url(
+            f"wikis/{wiki_id}/versions/{version_id}/content/"
+        )
+
+    attributes = version.get("attributes") or {}
+    relationships = version.get("relationships") or {}
+
+    row: dict[str, Any] = {
+        "version": version_id,
+        "date_created": str(
+            attributes.get("date_created") or ""
+        ),
+        "user_guid": (
+            relationship_id(relationships.get("user")) or ""
+        ),
+        "size": attributes.get("size", ""),
+        "content_type": str(
+            attributes.get("content_type") or ""
+        ),
+        "filename": filename,
+        "download_status": "failed",
+        "error": "",
+        "api_url": str(
+            (version.get("links") or {}).get("self") or ""
+        ),
+    }
+
+    try:
+        if not isinstance(version_url, str) or not version_url:
+            raise ChecklistError(
+                "No version-content download link was provided"
+            )
+
+        content = client.get_text(version_url)
+        (history_folder / filename).write_text(
+            content,
+            encoding="utf-8",
+        )
+
+        row["download_status"] = "downloaded"
+        node.wiki_version_count += 1
+    except (ChecklistError, OSError) as error:
+        row["error"] = str(error)
+        add_issue(
+            issues,
+            node,
+            "wiki version",
+            f"{wiki_id}:{version_id}",
+            error,
+        )
+
+    return row
+
+
+def export_wiki_history(
+    client: OSFClient,
+    node: NodeRecord,
+    wiki: dict[str, Any],
+    job: ExportJob,
+    issues: list[ExportIssue],
+) -> int:
+    """Export every available version of one wiki page."""
+    page_name, wiki_id = wiki_page_details(wiki)
+    versions_url = related_href(
+        (wiki.get("relationships") or {}).get("versions")
+    )
+
+    if not versions_url and wiki_id != "unknown":
+        versions_url = client.api_url(
+            f"wikis/{wiki_id}/versions/"
+        )
+
+    if not versions_url:
+        add_issue(
+            issues,
+            node,
+            "wiki version history",
+            wiki_id,
+            "No version-history link was provided",
+        )
+        return 0
+
+    try:
+        versions = sorted(
+            client.paginate(versions_url),
+            key=wiki_version_sort_key,
+        )
+    except ChecklistError as error:
+        add_issue(
+            issues,
+            node,
+            "wiki version history",
+            wiki_id,
+            error,
+        )
+        return 0
+
+    if not versions:
+        return 0
+
+    assert node.folder is not None
+    history_folder = (
+        action_output_folder(node, "wiki_history")
+        / f"{safe_segment(page_name, 120)} [{wiki_id}]"
+    )
+
+    try:
+        history_folder.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        add_issue(
+            issues,
+            node,
+            "wiki version history folder",
+            wiki_id,
+            error,
+        )
+        return 0
+
+    numeric_widths = [
+        len(str(version.get("id")))
+        for version in versions
+        if str(version.get("id") or "").isdigit()
+    ]
+    width = max([4, *numeric_widths])
+
+    metadata_rows: list[dict[str, Any]] = []
+    downloaded_count = 0
+
+    for version_index, version in enumerate(
+        versions,
+        start=1,
+    ):
+        check_cancel(job)
+
+        row = export_one_wiki_version(
+            client,
+            node,
+            wiki,
+            version,
+            width,
+            version_index,
+            history_folder,
+            issues,
+        )
+        metadata_rows.append(row)
+
+        if row["download_status"] == "downloaded":
+            downloaded_count += 1
+
+    try:
+        write_wiki_history_metadata(
+            history_folder,
+            node,
+            wiki,
+            metadata_rows,
+        )
+    except OSError as error:
+        add_issue(
+            issues,
+            node,
+            "wiki history index",
+            wiki_id,
+            error,
+        )
+
+    return downloaded_count
+
+
+def export_node_wikis(
+    client: OSFClient,
+    node: NodeRecord,
+    job: ExportJob,
+    issues: list[ExportIssue],
+    *,
+    include_current: bool,
+    include_history: bool,
+) -> tuple[int, int]:
+    """Export the selected wiki content for one node."""
+    wikis = get_node_wikis(client, node, issues)
+    if wikis is None:
+        return 0, 0
+
+    page_count = 0
+    version_count = 0
+
+    for wiki in wikis:
+        check_cancel(job)
+
+        if include_current and export_current_wiki_page(
+            client,
+            node,
+            wiki,
+            issues,
+        ):
+            page_count += 1
+
+        if include_history:
+            version_count += export_wiki_history(
+                client,
+                node,
+                wiki,
+                job,
+                issues,
+            )
+
+    return page_count, version_count
+
+
 def export_wikis(
     client: OSFClient,
     nodes: list[NodeRecord],
@@ -1605,151 +2110,42 @@ def export_wikis(
     include_current: bool,
     include_history: bool,
 ) -> tuple[int, int]:
+    """Export the selected wiki content for a collection of nodes."""
     if not include_current and not include_history:
-        raise ChecklistError("Choose current wikis, wiki version history, or both.")
+        raise ChecklistError(
+            "Choose current wikis, wiki version history, or both."
+        )
+
     page_total = 0
     version_total = 0
     node_count = max(1, len(nodes))
+
     for node_index, node in enumerate(nodes):
         check_cancel(job)
-        report(start + span * node_index / node_count, f"Wikis: {node.display_name}")
-        relationships = node.raw.get("relationships") or {}
-        wikis_url = related_href(relationships.get("wikis")) or client.api_url(
-            f"nodes/{node.guid}/wikis/"
+        report(
+            start + span * node_index / node_count,
+            f"Wikis: {node.display_name}",
         )
-        try:
-            wikis = list(client.paginate(wikis_url))
-        except ChecklistError as error:
-            add_issue(
-                issues,
-                node,
-                "wiki collection",
-                node.guid,
-                error,
-                critical=True,
-            )
-            continue
-        wikis.sort(key=lambda item: wiki_page_details(item)[0].casefold())
 
-        for wiki in wikis:
-            check_cancel(job)
-            page_name, wiki_id = wiki_page_details(wiki)
-            if include_current:
-                download_url = link_href((wiki.get("links") or {}).get("download"))
-                if not download_url and wiki_id != "unknown":
-                    download_url = client.api_url(f"wikis/{wiki_id}/content/")
-                try:
-                    if not isinstance(download_url, str) or not download_url:
-                        raise ChecklistError(
-                            "No current-content download link was provided"
-                        )
-                    content = client.get_text(download_url)
-                    assert node.folder is not None
-                    (
-                        action_output_folder(node, "wiki_current")
-                        / wiki_filename(node, wiki)
-                    ).write_text(content, encoding="utf-8")
-                    node.wiki_count += 1
-                    page_total += 1
-                except (ChecklistError, OSError) as error:
-                    add_issue(issues, node, "current wiki page", wiki_id, error)
+        page_count, version_count = export_node_wikis(
+            client,
+            node,
+            job,
+            issues,
+            include_current=include_current,
+            include_history=include_history,
+        )
+        page_total += page_count
+        version_total += version_count
 
-            if not include_history:
-                continue
-            versions_url = related_href(
-                (wiki.get("relationships") or {}).get("versions")
-            )
-            if not versions_url and wiki_id != "unknown":
-                versions_url = client.api_url(f"wikis/{wiki_id}/versions/")
-            if not versions_url:
-                add_issue(
-                    issues,
-                    node,
-                    "wiki version history",
-                    wiki_id,
-                    "No version-history link was provided",
-                )
-                continue
-            try:
-                versions = sorted(
-                    client.paginate(versions_url), key=wiki_version_sort_key
-                )
-            except ChecklistError as error:
-                add_issue(issues, node, "wiki version history", wiki_id, error)
-                continue
-            if not versions:
-                continue
+    if include_current and include_history:
+        completion_message = "Wiki export finished"
+    elif include_current:
+        completion_message = "Current wiki export finished"
+    else:
+        completion_message = "Wiki version-history export finished"
 
-            assert node.folder is not None
-            history_folder = (
-                action_output_folder(node, "wiki_history")
-                / f"{safe_segment(page_name, 120)} [{wiki_id}]"
-            )
-            history_folder.mkdir(parents=True, exist_ok=True)
-            widths = [
-                len(str(item.get("id")))
-                for item in versions
-                if str(item.get("id") or "").isdigit()
-            ]
-            width = max([4, *widths])
-            metadata_rows: list[dict[str, Any]] = []
-            for version_index, version in enumerate(versions, start=1):
-                check_cancel(job)
-                version_id = str(version.get("id") or version_index)
-                filename = wiki_version_filename(
-                    node, wiki, version, width, version_index
-                )
-                version_url = link_href((version.get("links") or {}).get("download"))
-                if not version_url and wiki_id != "unknown":
-                    version_url = client.api_url(
-                        f"wikis/{wiki_id}/versions/{version_id}/content/"
-                    )
-                attributes = version.get("attributes") or {}
-                row: dict[str, Any] = {
-                    "version": version_id,
-                    "date_created": str(attributes.get("date_created") or ""),
-                    "user_guid": relationship_id(
-                        (version.get("relationships") or {}).get("user")
-                    )
-                    or "",
-                    "size": attributes.get("size", ""),
-                    "content_type": str(attributes.get("content_type") or ""),
-                    "filename": filename,
-                    "download_status": "failed",
-                    "error": "",
-                    "api_url": str((version.get("links") or {}).get("self") or ""),
-                }
-                try:
-                    if not isinstance(version_url, str) or not version_url:
-                        raise ChecklistError(
-                            "No version-content download link was provided"
-                        )
-                    (history_folder / filename).write_text(
-                        client.get_text(version_url), encoding="utf-8"
-                    )
-                    row["download_status"] = "downloaded"
-                    node.wiki_version_count += 1
-                    version_total += 1
-                except (ChecklistError, OSError) as error:
-                    row["error"] = str(error)
-                    add_issue(
-                        issues,
-                        node,
-                        "wiki version",
-                        f"{wiki_id}:{version_id}",
-                        error,
-                    )
-                metadata_rows.append(row)
-            try:
-                write_wiki_history_metadata(history_folder, node, wiki, metadata_rows)
-            except OSError as error:
-                add_issue(issues, node, "wiki history index", wiki_id, error)
-    report(
-        start + span,
-        "Current wiki export finished"
-        if include_current
-        else "Wiki version-history export finished",
-    )
+    report(start + span, completion_message)
     return page_total, version_total
 
 
@@ -1870,46 +2266,71 @@ def write_log_files(
         handle.write("\n")
 
 
-def organize_logs(
+LogRecord = dict[str, Any]
+LogsByNode = dict[str, list[LogRecord]]
+FormerLogs = dict[tuple[str, str], list[LogRecord]]
+
+
+def partition_logs(
     root: NodeRecord,
-    nodes: list[NodeRecord],
-    logs: list[dict[str, Any]],
-    issues: list[ExportIssue],
-    all_nodes: list[NodeRecord] | None = None,
-) -> int:
-    node_map = {node.guid: node for node in nodes}
-    full_node_map = {
-        node.guid: node for node in (all_nodes if all_nodes is not None else nodes)
+    logs: list[LogRecord],
+    node_map: dict[str, NodeRecord],
+    full_node_map: dict[str, NodeRecord],
+) -> tuple[LogsByNode, FormerLogs, list[LogRecord]]:
+    """Classify logs by their current, former, or unknown owner."""
+    current: LogsByNode = {
+        guid: [] for guid in node_map
     }
-    grouped: dict[str, list[dict[str, Any]]] = {node.guid: [] for node in nodes}
-    former: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    unassigned: list[dict[str, Any]] = []
+    former: FormerLogs = {}
+    unassigned: list[LogRecord] = []
+
     for log in logs:
-        origin = log_origin_guid(log)
-        if origin in node_map:
-            grouped[origin].append(log)
-        elif origin in full_node_map:
+        origin_guid = log_origin_guid(log)
+
+        if origin_guid in node_map:
+            current[origin_guid].append(log)
+            continue
+
+        if origin_guid in full_node_map:
             # A targeted retry may encounter activity belonging to another
             # still-current component. Its successful file is left untouched.
             continue
-        elif origin:
-            parent = log_context_guid(log)
-            if parent not in full_node_map:
-                parent = root.guid
-            former.setdefault((str(parent), origin), []).append(log)
-        else:
-            unassigned.append(log)
 
+        if origin_guid:
+            parent_guid = log_context_guid(log)
+            if parent_guid not in full_node_map:
+                parent_guid = root.guid
+
+            former.setdefault(
+                (str(parent_guid), origin_guid),
+                [],
+            ).append(log)
+            continue
+
+        unassigned.append(log)
+
+    return current, former, unassigned
+
+
+def write_current_log_groups(
+    nodes: list[NodeRecord],
+    grouped_logs: LogsByNode,
+    issues: list[ExportIssue],
+) -> None:
+    """Write one activity-log export for each current node."""
     for node in nodes:
         assert node.folder is not None
-        node.log_count = len(grouped[node.guid])
+
+        node_logs = grouped_logs[node.guid]
+        node.log_count = len(node_logs)
+
         try:
             write_log_files(
                 action_output_folder(node, "logs"),
                 node.display_name,
                 node.guid,
                 node.title,
-                grouped[node.guid],
+                node_logs,
             )
         except OSError as error:
             add_issue(
@@ -1920,19 +2341,41 @@ def organize_logs(
                 error,
                 critical=True,
             )
-    for (parent_guid, origin_guid), former_logs in sorted(former.items()):
+
+
+def write_former_log_groups(
+    full_node_map: dict[str, NodeRecord],
+    former_logs: FormerLogs,
+    issues: list[ExportIssue],
+) -> None:
+    """Write logs belonging to former or inaccessible components."""
+    for (
+        parent_guid,
+        origin_guid,
+    ), component_logs in sorted(former_logs.items()):
         parent = full_node_map[parent_guid]
         assert parent.folder is not None
-        title = log_origin_title(former_logs[0], origin_guid)
-        display = title_guid_name(title, origin_guid)
+
+        title = log_origin_title(
+            component_logs[0],
+            origin_guid,
+        )
+        display_name = title_guid_name(title, origin_guid)
         folder = (
             action_output_folder(parent, "logs")
             / "Former or inaccessible components"
-            / display
+            / display_name
         )
+
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            write_log_files(folder, display, origin_guid, title, former_logs)
+            write_log_files(
+                folder,
+                display_name,
+                origin_guid,
+                title,
+                component_logs,
+            )
         except OSError as error:
             add_issue(
                 issues,
@@ -1941,24 +2384,77 @@ def organize_logs(
                 origin_guid,
                 error,
             )
-    if unassigned:
-        assert root.folder is not None
-        try:
-            write_log_files(
-                action_output_folder(root, "logs"),
-                f"{root.display_name} - Unassigned",
-                "",
-                "Unassigned activity",
-                unassigned,
-            )
-        except OSError as error:
-            add_issue(
-                issues,
-                root,
-                "unassigned activity-log file",
-                root.guid,
-                error,
-            )
+
+
+def write_unassigned_log_group(
+    root: NodeRecord,
+    unassigned_logs: list[LogRecord],
+    issues: list[ExportIssue],
+) -> None:
+    """Write logs for which OSF supplied no identifiable owner."""
+    if not unassigned_logs:
+        return
+
+    assert root.folder is not None
+
+    try:
+        write_log_files(
+            action_output_folder(root, "logs"),
+            f"{root.display_name} - Unassigned",
+            "",
+            "Unassigned activity",
+            unassigned_logs,
+        )
+    except OSError as error:
+        add_issue(
+            issues,
+            root,
+            "unassigned activity-log file",
+            root.guid,
+            error,
+        )
+
+
+def organize_logs(
+    root: NodeRecord,
+    nodes: list[NodeRecord],
+    logs: list[LogRecord],
+    issues: list[ExportIssue],
+    all_nodes: list[NodeRecord] | None = None,
+) -> int:
+    """Classify activity logs and write them into the export tree."""
+    node_map = {
+        node.guid: node for node in nodes
+    }
+    full_node_map = (
+        {node.guid: node for node in all_nodes}
+        if all_nodes is not None
+        else node_map
+    )
+
+    current, former, unassigned = partition_logs(
+        root,
+        logs,
+        node_map,
+        full_node_map,
+    )
+
+    write_current_log_groups(
+        nodes,
+        current,
+        issues,
+    )
+    write_former_log_groups(
+        full_node_map,
+        former,
+        issues,
+    )
+    write_unassigned_log_group(
+        root,
+        unassigned,
+        issues,
+    )
+
     return len(logs)
 
 
@@ -2024,9 +2520,14 @@ def export_file_archives(
     total_bytes = 0
     download_span = span - discovery_span
     archive_total = max(1, len(archives))
-    for index, (node, provider, label, download_url) in enumerate(archives):
+for index, (node, provider, label, download_url) in enumerate(archives):
+    # Give the file service a short break between Download as ZIP jobs.
+    if index > 0:
         check_cancel(job)
-        report(
+        time.sleep(FILE_ARCHIVE_PAUSE_SECONDS)
+
+    check_cancel(job)
+    report(
             start + discovery_span + download_span * index / archive_total,
             f"Downloading {label} files: {node.display_name}",
         )
@@ -2655,40 +3156,10 @@ def render_node(
 </li>
 """
 
-
-def render_html(app: ChecklistApp) -> str:
-    all_nodes = [node for root in app.roots for node in flatten_tree(root)]
-    rows = flatten_for_csv(app.roots)
-    public_count = sum(1 for node in all_nodes if node.public)
-    private_count = len(all_nodes) - public_count
-    reviewed_guids = {guid for guid, reviewed in app.checks.items() if reviewed}
-    nodes_html = "".join(
-        render_node(root, reviewed_guids, root=True) for root in app.roots
-    )
-    replacements = {
-        "__ACCOUNT__": html.escape(app.account_name),
-        "__ROOT_COUNT__": f"{len(app.roots):,}",
-        "__NODE_COUNT__": f"{len(all_nodes):,}",
-        "__PUBLIC_COUNT__": f"{public_count:,}",
-        "__PRIVATE_COUNT__": f"{private_count:,}",
-        "__NODE_HTML__": nodes_html,
-        "__SESSION_KEY__": json.dumps(app.session_key),
-        "__ROWS_JSON__": json.dumps(rows, ensure_ascii=False).replace("</", "<\\/"),
-        "__CHECKS_JSON__": json.dumps(app.checks, ensure_ascii=False).replace(
-            "</", "<\\/"
-        ),
-        "__OUTPUT_BASE__": html.escape(str(app.output_base)),
-        "__VERSION__": SCRIPT_VERSION,
-    }
-    template = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
-<title>OSF Export Checklist - Comprehensive Metadata</title>
-<style>
+# Kept as an embedded resource so the checklist remains a single-file tool.
+# Isolating it here keeps the HTML renderer readable and makes the stylesheet
+# straightforward to review or replace.
+DASHBOARD_CSS = r"""
 :root {
   --ink: #20313d;
   --muted: #657985;
@@ -3089,7 +3560,41 @@ footer {
     position: static;
   }
 }
-</style>
+""".strip()
+def render_html(app: ChecklistApp) -> str:
+    all_nodes = [node for root in app.roots for node in flatten_tree(root)]
+    rows = flatten_for_csv(app.roots)
+    public_count = sum(1 for node in all_nodes if node.public)
+    private_count = len(all_nodes) - public_count
+    reviewed_guids = {guid for guid, reviewed in app.checks.items() if reviewed}
+    nodes_html = "".join(
+        render_node(root, reviewed_guids, root=True) for root in app.roots
+    )
+replacements = {
+    "__DASHBOARD_CSS__": DASHBOARD_CSS,
+    "__ACCOUNT__": html.escape(app.account_name),
+        "__ROOT_COUNT__": f"{len(app.roots):,}",
+        "__NODE_COUNT__": f"{len(all_nodes):,}",
+        "__PUBLIC_COUNT__": f"{public_count:,}",
+        "__PRIVATE_COUNT__": f"{private_count:,}",
+        "__NODE_HTML__": nodes_html,
+        "__SESSION_KEY__": json.dumps(app.session_key),
+        "__OSF_STATUS_URL__": json.dumps(OSF_STATUS_URL),
+        "__ROWS_JSON__": json.dumps(rows, ensure_ascii=False).replace("</", "<\\/"),
+        "__CHECKS_JSON__": json.dumps(app.checks, ensure_ascii=False).replace(
+            "</", "<\\/"
+        ),
+        "__OUTPUT_BASE__": html.escape(str(app.output_base)),
+        "__VERSION__": SCRIPT_VERSION,
+    }
+    template = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+<title>OSF Export Checklist - Comprehensive Metadata</title>
 </head>
 <body>
 <header><h1>OSF Export Checklist</h1><p>__ACCOUNT__ · <strong>Version __VERSION__</strong></p></header>
@@ -3126,6 +3631,7 @@ footer {
 (() => {
   "use strict";
   const KEY = __SESSION_KEY__,
+    STATUS_URL = __OSF_STATUS_URL__,
     rows = __ROWS_JSON__;
   let checks = __CHECKS_JSON__;
   const nodes = [...document.querySelectorAll(".node")],
@@ -3342,7 +3848,7 @@ footer {
         ].includes(job.status);
         const groups = job.issue_groups || [];
         const issues = groups.length
-          ? `<details class="job-issues" data-job="${escapeText(job.id)}"${openIssues.has(job.id) ? " open" : ""}><summary>${job.critical_failure_count || 0} critical failure(s), ${job.omission_count || 0} omission(s)</summary><ul>${groups.map((group) => `<li class="${escapeText(group.severity)}"><strong>${group.severity === "critical" ? "Critical" : "Omission"}:</strong> ${escapeText(group.message)}<ul class="issue-elements">${(group.elements || []).map((element) => `<li>${escapeText(element.description)}</li>`).join("")}</ul></li>`).join("")}</ul></details>`
+          ? `<details class="job-issues" data-job="${escapeText(job.id)}"${openIssues.has(job.id) ? " open" : ""}><summary>${job.critical_failure_count || 0} critical failure(s), ${job.omission_count || 0} omission(s)</summary><ul>${groups.map((group) => `<li class="${escapeText(group.severity)}"><strong>${group.severity === "critical" ? "Critical" : "Omission"}:</strong> ${escapeText(group.message)}${String(group.reason || "").toLowerCase().includes("undergoing maintenance") ? ' <a href="' + escapeText(STATUS_URL) + '" target="_blank" rel="noopener noreferrer">Check OSF status</a>' : ""}<ul class="issue-elements">${(group.elements || []).map((element) => `<li>${escapeText(element.description)}</li>`).join("")}</ul></li>`).join("")}</ul></details>`
           : "";
         const plan = job.retry_plan || {};
         const retryLabel =
