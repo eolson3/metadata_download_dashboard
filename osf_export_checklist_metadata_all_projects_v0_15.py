@@ -613,12 +613,12 @@ class OSFClient:
     def __init__(
         self, api_base: str, token: str, timeout: int = REQUEST_TIMEOUT
     ) -> None:
-       self.api_base = api_base.rstrip("/")
-self.token = token.strip()
-self.timeout = timeout
-self._request_lock = threading.Lock()
-self._has_started_request = False
-api_host = urllib.parse.urlparse(self.api_base).hostname or ""
+        self.api_base = api_base.rstrip("/")
+        self.token = token.strip()
+        self.timeout = timeout
+        self._request_lock = threading.Lock()
+        self._has_started_request = False
+        api_host = urllib.parse.urlparse(self.api_base).hostname or ""
         self.trusted_hosts = {api_host}
         self.opener = urllib.request.build_opener(
             SafeRedirectHandler(self.trusted_hosts)
@@ -628,7 +628,7 @@ api_host = urllib.parse.urlparse(self.api_base).hostname or ""
         return f"{self.api_base}/{path.lstrip('/')}"
 
     def headers(
-        self, url: str, accept: str = "application/vnd.api+json"
+        self, url: str, accept: str = JSONAPI_MEDIA_TYPE,
     ) -> dict[str, str]:
         headers = {"Accept": accept, "User-Agent": USER_AGENT}
         if urllib.parse.urlparse(url).hostname in self.trusted_hosts:
@@ -650,26 +650,26 @@ api_host = urllib.parse.urlparse(self.api_base).hostname or ""
             f"OSF returned an unexpected file-download host: {host or 'missing host'}"
         )
 
-def open(
-    self,
-    url: str,
-    accept: str = "application/vnd.api+json",
-    extra: dict[str, str] | None = None,
-):
-    headers = self.headers(url, accept)
-    headers.update(extra or {})
-    request = urllib.request.Request(url, headers=headers, method="GET")
+    def open(
+        self,
+        url: str,
+        accept: str = JSONAPI_MEDIA_TYPE,
+        extra: dict[str, str] | None = None,
+    ):
+        headers = self.headers(url, accept)
+        headers.update(extra or {})
+        request = urllib.request.Request(url, headers=headers, method="GET")
 
-    with self._request_lock:
-        if self._has_started_request:
-            time.sleep(REQUEST_PAUSE_SECONDS)
-        self._has_started_request = True
-        return self.opener.open(request, timeout=self.timeout)
+        with self._request_lock:
+            if self._has_started_request:
+                time.sleep(REQUEST_PAUSE_SECONDS)
+            self._has_started_request = True
+            return self.opener.open(request, timeout=self.timeout)
 
     def request_bytes(
         self,
         url: str,
-        accept: str = "application/vnd.api+json",
+        accept: str = JSONAPI_MEDIA_TYPE,
         absent_statuses: set[int] | None = None,
     ) -> bytes | None:
         last_error: Exception | None = None
@@ -797,50 +797,50 @@ def open(
             raise ChecklistError(f"OSF returned no response for {url}")
         return raw.decode("utf-8", errors="replace")
 
-def paginate(
-    self,
-    url: str,
-    *,
-    default_sort: str | None = None,
-) -> Iterable[dict[str, Any]]:
-    next_url: str | None = add_page_size(
-        url,
-        default_sort=default_sort,
-    )
-    seen: set[str] = set()
-
-    while next_url:
-        if next_url in seen:
-            raise ChecklistError(f"OSF repeated a pagination link: {next_url}")
-
-        seen.add(next_url)
-        document = self.get_json(next_url)
-        data = document.get("data", [])
-
-        if isinstance(data, dict):
-            data = [data]
-
-        if not isinstance(data, list):
-            raise ChecklistError(
-                f"Unexpected paginated response for {next_url}"
-            )
-
-        for item in data:
-            if isinstance(item, dict):
-                yield item
-
-        next_value = (document.get("links") or {}).get("next")
-        if isinstance(next_value, dict):
-            next_value = next_value.get("href")
-
-        next_url = (
-            add_page_size(
-                next_value,
-                default_sort=default_sort,
-            )
-            if isinstance(next_value, str) and next_value
-            else None
+    def paginate(
+        self,
+        url: str,
+        *,
+        default_sort: str | None = None,
+    ) -> Iterable[dict[str, Any]]:
+        next_url: str | None = add_page_size(
+            url,
+            default_sort=default_sort,
         )
+        seen: set[str] = set()
+
+        while next_url:
+            if next_url in seen:
+                raise ChecklistError(f"OSF repeated a pagination link: {next_url}")
+
+            seen.add(next_url)
+            document = self.get_json(next_url)
+            data = document.get("data", [])
+
+            if isinstance(data, dict):
+                data = [data]
+
+            if not isinstance(data, list):
+                raise ChecklistError(
+                    f"Unexpected paginated response for {next_url}"
+                )
+
+            for item in data:
+                if isinstance(item, dict):
+                    yield item
+
+            next_value = (document.get("links") or {}).get("next")
+            if isinstance(next_value, dict):
+                next_value = next_value.get("href")
+
+            next_url = (
+                add_page_size(
+                    next_value,
+                    default_sort=default_sort,
+                )
+                if isinstance(next_value, str) and next_value
+                else None
+            )
 
 def http_error_body(error: urllib.error.HTTPError) -> bytes:
     """Read an HTTP error body once and retain it for later classification."""
@@ -1021,13 +1021,18 @@ def get_inventory(client: OSFClient) -> list[dict[str, Any]]:
         f"users/me/nodes/?{urllib.parse.urlencode({'page[size]': PAGE_SIZE})}"
     )
     records: list[dict[str, Any]] = []
-for record in client.paginate(
-    url,
-    default_sort="-date_modified",
-):
-    records.append(record)
+
+    for record in client.paginate(
+        url,
+        default_sort="-date_modified",
+    ):
+        records.append(record)
         if len(records) % 100 == 0:
-            print(f"Retrieved {len(records):,} projects/components...", flush=True)
+            print(
+                f"Retrieved {len(records):,} projects/components...",
+                flush=True,
+            )
+
     return records
 
 
@@ -1378,7 +1383,7 @@ def render_complete_metadata_html(package: dict[str, Any]) -> str:
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
 <title>{html.escape(title)} [{html.escape(guid)}] - Complete Metadata</title>
 <style>
-__DASHBOARD_CSS__
+{DASHBOARD_CSS}
 </style>
 </head><body>
 <header><h1>{html.escape(title)} [{html.escape(guid)}]</h1><p>Complete OSF metadata export · {html.escape(str(package.get("exported_utc") or ""))}</p></header>
@@ -2520,14 +2525,15 @@ def export_file_archives(
     total_bytes = 0
     download_span = span - discovery_span
     archive_total = max(1, len(archives))
-for index, (node, provider, label, download_url) in enumerate(archives):
-    # Give the file service a short break between Download as ZIP jobs.
-    if index > 0:
-        check_cancel(job)
-        time.sleep(FILE_ARCHIVE_PAUSE_SECONDS)
+    
+    for index, (node, provider, label, download_url) in enumerate(archives):
+        # Give the file service a short break between Download as ZIP jobs.
+        if index > 0:
+            check_cancel(job)
+            time.sleep(FILE_ARCHIVE_PAUSE_SECONDS)
 
-    check_cancel(job)
-    report(
+        check_cancel(job)
+        report(
             start + discovery_span + download_span * index / archive_total,
             f"Downloading {label} files: {node.display_name}",
         )
@@ -2575,14 +2581,19 @@ def write_export_summary(
         if job.retry_of
         else f"{action_title(job.action)} Export Summary"
     )
-    summary_folder = action_output_folder(root, job.action)
-    summary_folder.mkdir(parents=True, exist_ok=True)
-path = summary_folder / owner_prefixed_name(
-    root,
-    f" - {summary_label}.json",
-)    
-critical_count = sum(1 for issue in issues if issue.severity == "critical")
-    omission_count = sum(1 for issue in issues if issue.severity == "omission")
+        summary_folder = action_output_folder(root, job.action)
+        summary_folder.mkdir(parents=True, exist_ok=True)
+
+        path = summary_folder / owner_prefixed_name(
+            root,
+            f" - {summary_label}.json",
+        )    
+        critical_count = sum(
+            1 for issue in issues if issue.severity == "critical"
+        )
+        omission_count = sum(
+            1 for issue in issues if issue.severity == "omission"
+        )
     notes_by_action = {
         "metadata": [
             "Each Metadata folder contains readable comprehensive HTML and JSON.",
@@ -3566,13 +3577,15 @@ def render_html(app: ChecklistApp) -> str:
     rows = flatten_for_csv(app.roots)
     public_count = sum(1 for node in all_nodes if node.public)
     private_count = len(all_nodes) - public_count
-    reviewed_guids = {guid for guid, reviewed in app.checks.items() if reviewed}
+    reviewed_guids = {
+        guid for guid, reviewed in app.checks.items() if reviewed
+    }
     nodes_html = "".join(
         render_node(root, reviewed_guids, root=True) for root in app.roots
     )
-replacements = {
-    "__DASHBOARD_CSS__": DASHBOARD_CSS,
-    "__ACCOUNT__": html.escape(app.account_name),
+    replacements = {
+        "__DASHBOARD_CSS__": DASHBOARD_CSS,
+        "__ACCOUNT__": html.escape(app.account_name),
         "__ROOT_COUNT__": f"{len(app.roots):,}",
         "__NODE_COUNT__": f"{len(all_nodes):,}",
         "__PUBLIC_COUNT__": f"{public_count:,}",
@@ -3595,6 +3608,9 @@ replacements = {
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
 <title>OSF Export Checklist - Comprehensive Metadata</title>
+<style>
+__DASHBOARD_CSS__
+</style>
 </head>
 <body>
 <header><h1>OSF Export Checklist</h1><p>__ACCOUNT__ · <strong>Version __VERSION__</strong></p></header>
