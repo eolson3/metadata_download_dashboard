@@ -48,6 +48,7 @@ REQUEST_PAUSE_SECONDS = 0.5
 MAX_RETRIES = 6
 MIN_MAINTENANCE_RETRY_SECONDS = 5 * 60
 FILE_ARCHIVE_PAUSE_SECONDS = 2.0
+OSF_STORAGE_DAZ_PAGE_SIZE = 100
 OSF_STATUS_URL = "https://status.cos.io/"
 RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 USER_AGENT = f"OSF-Export-Checklist/{SCRIPT_VERSION}"
@@ -170,6 +171,7 @@ class NodeRecord:
     log_count: int = 0
     file_archive_count: int = 0
     file_archive_bytes: int = 0
+    empty_file_provider_count: int = 0
 
     @property
     def display_name(self) -> str:
@@ -178,6 +180,24 @@ class NodeRecord:
     @property
     def visibility(self) -> str:
         return "Public" if self.public else "Private"
+
+
+@dataclass
+class FileArchiveRequest:
+    node: NodeRecord
+    provider: str
+    label: str
+    root_url: str
+    download_url: str
+    root_entries: list[dict[str, Any]]
+
+
+@dataclass
+class SplitArchiveResult:
+    archive_count: int = 0
+    byte_count: int = 0
+    handled_entries: int = 0
+    failed_entries: int = 0
 
 
 @dataclass
@@ -468,11 +488,16 @@ def provider_label(provider: str) -> str:
     return PROVIDER_LABELS.get(provider.casefold(), provider.replace("_", " ").title())
 
 
-def zip_download_url(url: str) -> str:
+def zip_download_url(url: str, *, paginated: bool = False) -> str:
     parsed = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     if not any(key == "zip" for key, _ in query):
         query.append(("zip", ""))
+    if paginated:
+        if not any(key == "paginated" for key, _ in query):
+            query.append(("paginated", "true"))
+        if not any(key == "limit" for key, _ in query):
+            query.append(("limit", str(OSF_STORAGE_DAZ_PAGE_SIZE)))
     return urllib.parse.urlunsplit(
         (
             parsed.scheme,
@@ -482,6 +507,21 @@ def zip_download_url(url: str) -> str:
             parsed.fragment,
         )
     )
+
+
+def discard_invalid_zip(path: Path) -> bool:
+    """Remove a known-invalid ZIP while preserving every readable archive."""
+    if not path.exists():
+        return False
+    try:
+        if not zipfile.is_zipfile(path):
+            raise zipfile.BadZipFile("missing ZIP end record")
+        with zipfile.ZipFile(path) as archive:
+            archive.infolist()
+    except (OSError, zipfile.BadZipFile):
+        path.unlink(missing_ok=True)
+        return True
+    return False
 
 
 def truncate_utf8(value: str, max_bytes: int) -> str:
@@ -725,6 +765,11 @@ class OSFClient:
         """Stream an OSF ZIP response to disk and return its byte size."""
         self.trust_download_host(url)
         temporary = destination.with_name(destination.name + ".part")
+
+        # Remove only a known-invalid result from an earlier run. A valid
+        # completed archive remains in place until its replacement validates.
+        discard_invalid_zip(destination)
+
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES):
             try:
@@ -743,6 +788,20 @@ class OSFClient:
                     raise ChecklistError(
                         "OSF returned a response that was not a valid ZIP archive."
                     )
+
+                try:
+                    with zipfile.ZipFile(temporary) as archive:
+                        has_file_members = any(
+                            not member.is_dir() for member in archive.infolist()
+                        )
+                except zipfile.BadZipFile as error:
+                    raise ChecklistError(
+                        "The OSF file service returned an incomplete or invalid "
+                        "ZIP archive."
+                    ) from error
+                if not has_file_members:
+                    temporary.unlink(missing_ok=True)
+                    return 0
                 os.replace(temporary, destination)
                 return destination.stat().st_size
             except JobCancelled:
@@ -2602,7 +2661,9 @@ def organize_logs(
     return len(logs)
 
 
-def provider_archive_details(record: dict[str, Any]) -> tuple[str, str, str]:
+def provider_archive_details(
+    record: dict[str, Any],
+) -> tuple[str, str, str, str]:
     attributes = record.get("attributes") or {}
     provider = str(
         attributes.get("provider")
@@ -2615,11 +2676,282 @@ def provider_archive_details(record: dict[str, Any]) -> tuple[str, str, str]:
     return (
         provider,
         provider_label(provider),
-        zip_download_url(root_url) if root_url else "",
+        root_url,
+        zip_download_url(
+            root_url,
+            paginated=provider == "osfstorage",
+        )
+        if root_url
+        else "",
     )
 
 
-def export_file_archives(
+def provider_root_entries(
+    client: OSFClient,
+    root_url: str,
+) -> list[dict[str, Any]]:
+    """Return the immediate entries in a storage-provider folder."""
+    client.trust_download_host(root_url)
+    data = client.get_json(root_url).get("data")
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        return [data]
+    raise ChecklistError(
+        f"OSF returned an unexpected storage-provider response for {root_url}"
+    )
+
+
+def invalid_zip_archive_error(error: Exception | str) -> bool:
+    text = str(error).casefold()
+    return (
+        "incomplete or invalid zip archive" in text
+        or "not a valid zip archive" in text
+    )
+
+
+def archive_entry_details(
+    record: dict[str, Any],
+) -> tuple[str, str, str, str]:
+    attributes = record.get("attributes") or {}
+    name = clean_title(
+        attributes.get("name"),
+        str(record.get("id") or "Untitled"),
+    )
+    identifier = str(
+        record.get("id")
+        or attributes.get("path")
+        or attributes.get("materialized_path")
+        or name
+    )
+    kind = str(attributes.get("kind") or "").casefold()
+    links = record.get("links") or {}
+    if kind == "folder":
+        item_url = link_href(links.get("upload")) or link_href(
+            links.get("download")
+        )
+    else:
+        item_url = link_href(links.get("download")) or link_href(
+            links.get("upload")
+        )
+    return name, identifier, kind, item_url or ""
+
+
+def split_archive_filename(
+    node: NodeRecord,
+    entry_name: str,
+    entry_id: str,
+) -> str:
+    safe_name = safe_segment(entry_name, 100)
+    safe_id = safe_segment(entry_id, 40)
+    return owner_prefixed_name(
+        node,
+        f" - {safe_name} [{safe_id}].zip",
+    )
+
+
+def merge_split_archive_results(
+    target: SplitArchiveResult,
+    source: SplitArchiveResult,
+) -> None:
+    target.archive_count += source.archive_count
+    target.byte_count += source.byte_count
+    target.handled_entries += source.handled_entries
+    target.failed_entries += source.failed_entries
+
+
+def split_invalid_folder_archive(
+    client: OSFClient,
+    request: FileArchiveRequest,
+    name: str,
+    identifier: str,
+    item_url: str,
+    output_folder: Path,
+    job: ExportJob,
+    issues: list[ExportIssue],
+    download_archive: Callable[[str, Path], int],
+    report_entry: Callable[[str], None],
+    seen_folders: set[str],
+    error: Exception,
+) -> SplitArchiveResult:
+    """Split one invalid folder ZIP into ZIPs for its immediate children."""
+    element_id = f"{request.provider}:{identifier}"
+    if item_url in seen_folders:
+        add_issue(
+            issues,
+            request.node,
+            "file ZIP archive",
+            element_id,
+            "OSF repeated a storage-folder link while splitting an invalid ZIP archive",
+        )
+        return SplitArchiveResult(failed_entries=1)
+
+    seen_folders.add(item_url)
+    try:
+        children = provider_root_entries(client, item_url)
+    except ChecklistError as metadata_error:
+        add_issue(
+            issues,
+            request.node,
+            "file ZIP archive",
+            element_id,
+            ChecklistError(
+                f"{error} OSF could not list the folder for a smaller "
+                f"ZIP fallback: {metadata_error}"
+            ),
+        )
+        return SplitArchiveResult(failed_entries=1)
+
+    if not children:
+        return SplitArchiveResult(handled_entries=1)
+
+    child_folder = output_folder / safe_segment(
+        f"{name} [{identifier}]",
+        120,
+    )
+    return download_split_archive_entries(
+        client,
+        request,
+        children,
+        child_folder,
+        job,
+        issues,
+        download_archive,
+        report_entry,
+        seen_folders,
+    )
+
+
+def download_split_archive_entry(
+    client: OSFClient,
+    request: FileArchiveRequest,
+    entry: dict[str, Any],
+    output_folder: Path,
+    job: ExportJob,
+    issues: list[ExportIssue],
+    download_archive: Callable[[str, Path], int],
+    report_entry: Callable[[str], None],
+    seen_folders: set[str],
+) -> SplitArchiveResult:
+    """Download one smaller DAZ archive, recursing only if it is invalid."""
+    check_cancel(job)
+    name, identifier, kind, item_url = archive_entry_details(entry)
+    element_id = f"{request.provider}:{identifier}"
+    if not item_url:
+        add_issue(
+            issues,
+            request.node,
+            "file ZIP archive",
+            element_id,
+            "OSF did not provide a ZIP-capable link for this storage item",
+        )
+        return SplitArchiveResult(failed_entries=1)
+
+    report_entry(name)
+    destination = output_folder / split_archive_filename(
+        request.node,
+        name,
+        identifier,
+    )
+    item_download_url = zip_download_url(
+        item_url,
+        paginated=request.provider == "osfstorage" and kind == "folder",
+    )
+    try:
+        size = download_archive(item_download_url, destination)
+    except (ChecklistError, OSError) as error:
+        if kind == "folder" and invalid_zip_archive_error(error):
+            return split_invalid_folder_archive(
+                client,
+                request,
+                name,
+                identifier,
+                item_url,
+                output_folder,
+                job,
+                issues,
+                download_archive,
+                report_entry,
+                seen_folders,
+                error,
+            )
+        add_issue(
+            issues,
+            request.node,
+            "file ZIP archive",
+            element_id,
+            error,
+        )
+        return SplitArchiveResult(failed_entries=1)
+
+    result = SplitArchiveResult(handled_entries=1)
+    if size:
+        result.archive_count = 1
+        result.byte_count = size
+        request.node.file_archive_count += 1
+        request.node.file_archive_bytes += size
+    return result
+
+
+def download_split_archive_entries(
+    client: OSFClient,
+    request: FileArchiveRequest,
+    entries: list[dict[str, Any]],
+    output_folder: Path,
+    job: ExportJob,
+    issues: list[ExportIssue],
+    download_archive: Callable[[str, Path], int],
+    report_entry: Callable[[str], None],
+    seen_folders: set[str],
+) -> SplitArchiveResult:
+    """Download smaller server-generated ZIPs for one provider subtree."""
+    result = SplitArchiveResult()
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    for entry in entries:
+        merge_split_archive_results(
+            result,
+            download_split_archive_entry(
+                client,
+                request,
+                entry,
+                output_folder,
+                job,
+                issues,
+                download_archive,
+                report_entry,
+                seen_folders,
+            ),
+        )
+
+    return result
+
+
+def prior_invalid_file_archive_scopes(root: NodeRecord) -> set[tuple[str, str]]:
+    """Find provider roots that a previous export proved could not form a ZIP."""
+    summary_folder = action_output_folder(root, "files")
+    if not summary_folder.is_dir():
+        return set()
+
+    scopes: set[tuple[str, str]] = set()
+    for path in summary_folder.glob("*Files as ZIP*Summary.json"):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for issue in document.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            if not invalid_zip_archive_error(str(issue.get("detail") or "")):
+                continue
+            guid = str(issue.get("project_guid") or "").casefold()
+            provider = str(issue.get("element_id") or "").split(":", 1)[0].casefold()
+            if guid and provider:
+                scopes.add((guid, provider))
+    return scopes
+
+
+def discover_file_archive_requests(
     client: OSFClient,
     nodes: list[NodeRecord],
     job: ExportJob,
@@ -2627,16 +2959,17 @@ def export_file_archives(
     report: ProgressCallback,
     start: float,
     span: float,
-) -> tuple[int, int]:
-    """Download one ZIP per configured storage provider into the node tree."""
-    archives: list[tuple[NodeRecord, str, str, str]] = []
+) -> tuple[list[FileArchiveRequest], dict[str, int], dict[str, int]]:
+    """Discover nonempty providers and retain their immediate entries."""
+    archives: list[FileArchiveRequest] = []
     expected_by_node: dict[str, int] = {}
+    succeeded_by_node: dict[str, int] = {}
     node_count = max(1, len(nodes))
-    discovery_span = span * 0.15
+
     for index, node in enumerate(nodes):
         check_cancel(job)
         report(
-            start + discovery_span * index / node_count,
+            start + span * index / node_count,
             f"Finding storage providers: {node.display_name}",
         )
         files_url = related_href((node.raw.get("relationships") or {}).get("files"))
@@ -2655,8 +2988,8 @@ def export_file_archives(
             continue
         for record in records:
             expected_by_node[node.guid] = expected_by_node.get(node.guid, 0) + 1
-            provider, label, download_url = provider_archive_details(record)
-            if not download_url:
+            provider, label, root_url, download_url = provider_archive_details(record)
+            if not root_url or not download_url:
                 add_issue(
                     issues,
                     node,
@@ -2665,45 +2998,196 @@ def export_file_archives(
                     "OSF did not provide a ZIP-capable storage-provider link",
                 )
                 continue
-            archives.append((node, provider, label, download_url))
+            try:
+                root_entries = provider_root_entries(client, root_url)
+                content_check_completed = True
+            except ChecklistError:
+                # The content check prevents unnecessary empty ZIP requests.
+                # If it cannot be completed, preserve the established DAZ path.
+                root_entries = []
+                content_check_completed = False
+            if not root_entries:
+                if not content_check_completed:
+                    archives.append(
+                        FileArchiveRequest(
+                            node,
+                            provider,
+                            label,
+                            root_url,
+                            download_url,
+                            [],
+                        )
+                    )
+                    continue
+                node.empty_file_provider_count += 1
+                succeeded_by_node[node.guid] = (
+                    succeeded_by_node.get(node.guid, 0) + 1
+                )
+                continue
+            archives.append(
+                FileArchiveRequest(
+                    node,
+                    provider,
+                    label,
+                    root_url,
+                    download_url,
+                    root_entries,
+                )
+            )
+
+    return archives, expected_by_node, succeeded_by_node
+
+
+def download_provider_archive(
+    client: OSFClient,
+    request: FileArchiveRequest,
+    job: ExportJob,
+    issues: list[ExportIssue],
+    download_archive: Callable[[str, Path], int],
+    report_entry: Callable[[str], None],
+    *,
+    use_split_archives: bool,
+) -> SplitArchiveResult:
+    """Download one provider ZIP or its smaller DAZ fallback archives."""
+    assert request.node.folder is not None
+    destination = action_output_folder(
+        request.node,
+        "files",
+    ) / owner_prefixed_name(
+        request.node,
+        f" - Files - {safe_segment(request.label, 80)}.zip",
+    )
+
+    if use_split_archives:
+        discard_invalid_zip(destination)
+    try:
+        if use_split_archives:
+            raise ChecklistError(
+                "A previous export identified this provider-level ZIP as invalid."
+            )
+        size = download_archive(request.download_url, destination)
+    except (ChecklistError, OSError) as error:
+        can_split = request.root_entries and (
+            use_split_archives or invalid_zip_archive_error(error)
+        )
+        if can_split:
+            split_folder = action_output_folder(
+                request.node,
+                "files",
+            ) / safe_segment(f"{request.label} - Split ZIPs", 120)
+            return download_split_archive_entries(
+                client,
+                request,
+                request.root_entries,
+                split_folder,
+                job,
+                issues,
+                download_archive,
+                report_entry,
+                {request.root_url},
+            )
+
+        add_issue(
+            issues,
+            request.node,
+            "file ZIP archive",
+            request.provider,
+            error,
+        )
+        return SplitArchiveResult(failed_entries=1)
+
+    result = SplitArchiveResult(handled_entries=1)
+    if size == 0:
+        request.node.empty_file_provider_count += 1
+        return result
+
+    result.archive_count = 1
+    result.byte_count = size
+    request.node.file_archive_count += 1
+    request.node.file_archive_bytes += size
+    return result
+
+
+def export_file_archives(
+    client: OSFClient,
+    nodes: list[NodeRecord],
+    job: ExportJob,
+    issues: list[ExportIssue],
+    report: ProgressCallback,
+    start: float,
+    span: float,
+    *,
+    split_providers: set[tuple[str, str]] | None = None,
+) -> tuple[int, int]:
+    """Download server-generated ZIP archives into the matching node tree."""
+    split_providers = split_providers or set()
+    discovery_span = span * 0.15
+    archives, expected_by_node, succeeded_by_node = (
+        discover_file_archive_requests(
+            client,
+            nodes,
+            job,
+            issues,
+            report,
+            start,
+            discovery_span,
+        )
+    )
 
     archive_count = 0
     total_bytes = 0
-    succeeded_by_node: dict[str, int] = {}
     download_span = span - discovery_span
     archive_total = max(1, len(archives))
-    
-    for index, (node, provider, label, download_url) in enumerate(archives):
-        # Give the file service a short break between Download as ZIP jobs.
-        if index > 0:
+
+    archive_attempt_count = 0
+
+    def download_archive(url: str, destination: Path) -> int:
+        nonlocal archive_attempt_count
+        if archive_attempt_count:
             check_cancel(job)
             time.sleep(FILE_ARCHIVE_PAUSE_SECONDS)
+        archive_attempt_count += 1
+        return client.download_file(
+            url,
+            destination,
+            cancelled=lambda: job.cancel_requested,
+        )
 
+    for index, request in enumerate(archives):
         check_cancel(job)
+        progress = start + discovery_span + download_span * index / archive_total
         report(
-            start + discovery_span + download_span * index / archive_total,
-            f"Downloading {label} files: {node.display_name}",
+            progress,
+            f"Downloading {request.label} files: {request.node.display_name}",
         )
-        assert node.folder is not None
-        destination = action_output_folder(node, "files") / owner_prefixed_name(
-            node,
-            f" - Files - {safe_segment(label, 80)}.zip",
+        use_split_archives = (
+            (request.node.guid, request.provider) in split_providers
+            and bool(request.root_entries)
         )
-        try:
-            size = client.download_file(
-                download_url,
-                destination,
-                cancelled=lambda: job.cancel_requested,
+
+        def report_entry(entry_name: str) -> None:
+            report(
+                progress,
+                f"Downloading smaller {request.label} ZIP: "
+                f"{entry_name} — {request.node.display_name}",
             )
-            archive_count += 1
-            total_bytes += size
-            succeeded_by_node[node.guid] = (
-                succeeded_by_node.get(node.guid, 0) + 1
+
+        result = download_provider_archive(
+            client,
+            request,
+            job,
+            issues,
+            download_archive,
+            report_entry,
+            use_split_archives=use_split_archives,
+        )
+        archive_count += result.archive_count
+        total_bytes += result.byte_count
+        if result.handled_entries:
+            succeeded_by_node[request.node.guid] = (
+                succeeded_by_node.get(request.node.guid, 0) + 1
             )
-            node.file_archive_count += 1
-            node.file_archive_bytes += size
-        except (ChecklistError, OSError) as error:
-            add_issue(issues, node, "file ZIP archive", provider, error)
+
     for node in nodes:
         expected = expected_by_node.get(node.guid, 0)
         if expected and succeeded_by_node.get(node.guid, 0) == 0:
@@ -2772,8 +3256,10 @@ def write_export_summary(
             "Activity logs are stored in an Activity Logs folder inside each matching project/component folder.",
         ],
         "files": [
-            "Each configured storage provider is downloaded as a separate ZIP archive.",
+            "Each configured storage provider is normally downloaded as one ZIP archive.",
+            "If OSF returns an invalid provider-level ZIP, the exporter uses smaller server-generated ZIP archives for that provider instead.",
             "ZIP archives are stored in a Files folder inside the matching project/component folder.",
+            "Storage providers containing no files do not create empty ZIP files and are counted in this summary.",
         ],
     }
     outcome = (
@@ -2823,6 +3309,7 @@ def write_export_summary(
                 "activity_log_entries": node.log_count,
                 "file_zip_archives": node.file_archive_count,
                 "file_zip_bytes": node.file_archive_bytes,
+                "empty_file_providers": node.empty_file_provider_count,
             }
             for node in nodes
         ],
@@ -3041,6 +3528,7 @@ class ChecklistApp:
             "unique_activity_log_entries": 0,
             "file_zip_archives": 0,
             "file_zip_bytes": 0,
+            "empty_file_providers": 0,
         }
         self.client.cancel_requested = lambda: job.cancel_requested
         try:
@@ -3049,6 +3537,11 @@ class ChecklistApp:
             root_folder = self.output_base / root.display_name
             ensure_hierarchy(root, root_folder, job.action)
             job.output_folder = str(root_folder)
+            split_file_providers = (
+                prior_invalid_file_archive_scopes(root)
+                if job.action == "files"
+                else set()
+            )
 
             def callback(progress: float, message: str) -> None:
                 self.report(job, progress, message)
@@ -3149,9 +3642,13 @@ class ChecklistApp:
                         callback,
                         task_start,
                         task_span,
+                        split_providers=split_file_providers,
                     )
                     counts["file_zip_archives"] = archives
                     counts["file_zip_bytes"] = archive_bytes
+                    counts["empty_file_providers"] = sum(
+                        node.empty_file_provider_count for node in target_nodes
+                    )
             check_cancel(job)
             self.report(job, 0.95, "Writing export summary")
             try:
@@ -3198,7 +3695,20 @@ class ChecklistApp:
                     )
                 else:
                     job.status = "completed"
-                    job.message = "Completed — all content succeeded."
+                    empty_provider_count = counts["empty_file_providers"]
+                    if job.action == "files" and empty_provider_count:
+                        provider_label = (
+                            "storage provider"
+                            if empty_provider_count == 1
+                            else "storage providers"
+                        )
+                        job.message = (
+                            "Completed — all available file ZIPs succeeded; "
+                            f"{empty_provider_count} empty {provider_label} "
+                            "contained no files to download."
+                        )
+                    else:
+                        job.message = "Completed — all content succeeded."
                 job.progress = 1.0
                 job.finished_at = utc_now()
         except JobCancelled:
@@ -3800,7 +4310,7 @@ __DASHBOARD_CSS__
       <label class="export-choice"><input type="checkbox" name="batchAction" value="wiki_current"><span><strong>Current wikis</strong><small>The most recent content of every wiki page.</small></span></label>
       <label class="export-choice"><input type="checkbox" name="batchAction" value="wiki_history"><span><strong>Wiki version history</strong><small>Every available historical wiki version with version indexes.</small></span></label>
       <label class="export-choice"><input type="checkbox" name="batchAction" value="logs"><span><strong>Activity logs</strong><small>Project and component activity records organized into the matching tree.</small></span></label>
-      <label class="export-choice"><input type="checkbox" name="batchAction" value="files"><span><strong>Files as ZIP</strong><small>One ZIP archive per configured storage provider for each project and component in the selected trees.</small></span></label>
+      <label class="export-choice"><input type="checkbox" name="batchAction" value="files"><span><strong>Files as ZIP</strong><small>One ZIP per storage provider when possible; smaller server-generated ZIPs are used if OSF returns an invalid provider archive.</small></span></label>
     </div>
     <div class="batch-buttons"><button class="primary" id="runBatch" type="button">Run selected exports</button></div>
     <div class="options"><span>Each checked content type runs independently and writes to its own named folder inside the matching project/component tree. An omission in one does not require rerunning the others. Jobs run sequentially, with only one export running at a time.</span></div>
