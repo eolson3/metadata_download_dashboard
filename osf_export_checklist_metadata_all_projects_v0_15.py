@@ -631,7 +631,9 @@ class OSFClient:
         )
 
     def api_url(self, path: str) -> str:
-            def wait(self, seconds: float) -> None:
+        return f"{self.api_base}/{path.lstrip('/')}"
+
+    def wait(self, seconds: float) -> None:
         """Wait between attempts while still responding to job cancellation."""
         remaining = max(0.0, seconds)
         while remaining > 0:
@@ -640,7 +642,6 @@ class OSFClient:
             interval = min(1.0, remaining)
             time.sleep(interval)
             remaining -= interval
-        return f"{self.api_base}/{path.lstrip('/')}"
 
     def headers(
         self, url: str, accept: str = JSONAPI_MEDIA_TYPE,
@@ -677,7 +678,7 @@ class OSFClient:
 
         with self._request_lock:
             if self._has_started_request:
-            self.wait(REQUEST_PAUSE_SECONDS)
+                self.wait(REQUEST_PAUSE_SECONDS)
             self._has_started_request = True
             return self.opener.open(request, timeout=self.timeout)
 
@@ -707,7 +708,7 @@ class OSFClient:
                 if permanent is not None:
                     raise permanent from error
                 if attempt < MAX_RETRIES - 1:
-                    time.wait(min(30.0, 2.0**attempt))
+                    self.wait(min(30.0, 2.0**attempt))
                     continue
                 raise ChecklistError(
                     "Could not reach OSF after several attempts. Check the internet "
@@ -751,7 +752,7 @@ class OSFClient:
                 last_error = error
                 temporary.unlink(missing_ok=True)
                 if error.code in RETRYABLE_HTTP_STATUSES and attempt < MAX_RETRIES - 1:
-                    time.wait(retry_delay(error, attempt))
+                    self.wait(retry_delay(error, attempt))
                     continue
                 raise http_error(error) from error
             except (urllib.error.URLError, TimeoutError) as error:
@@ -761,7 +762,7 @@ class OSFClient:
                 if permanent is not None:
                     raise permanent from error
                 if attempt < MAX_RETRIES - 1:
-                    time.wait(min(30.0, 2.0**attempt))
+                    self.wait(min(30.0, 2.0**attempt))
                     continue
                 raise ChecklistError(
                     "Could not reach the OSF file service after several attempts."
@@ -1492,6 +1493,8 @@ footer {
   }
 }
 """.strip()
+
+
 def render_complete_metadata_html(package: dict[str, Any]) -> str:
     project = package.get("project") or {}
     title = str(project.get("title") or "Untitled OSF project")
@@ -2626,7 +2629,7 @@ def export_file_archives(
     span: float,
 ) -> tuple[int, int]:
     """Download one ZIP per configured storage provider into the node tree."""
-        archives: list[tuple[NodeRecord, str, str, str]] = []
+    archives: list[tuple[NodeRecord, str, str, str]] = []
     expected_by_node: dict[str, int] = {}
     node_count = max(1, len(nodes))
     discovery_span = span * 0.15
@@ -3039,7 +3042,7 @@ class ChecklistApp:
             "file_zip_archives": 0,
             "file_zip_bytes": 0,
         }
-                self.client.cancel_requested = lambda: job.cancel_requested
+        self.client.cancel_requested = lambda: job.cancel_requested
         try:
             root = discover_tree(self.client, job.root_guid)
             nodes = flatten_tree(root)
@@ -3229,6 +3232,8 @@ class ChecklistApp:
 
         finally:
             self.client.cancel_requested = None
+
+
 def flatten_for_csv(
     nodes: list[NodeRecord], depth: int = 0, parent_guid: str = ""
 ) -> list[dict[str, Any]]:
@@ -3867,7 +3872,7 @@ __DASHBOARD_CSS__
           permission.value === node.dataset.permission) &&
         (completion.value === "all" ||
           completion.value === (reviewed ? "checked" : "unchecked"));
-           node.dataset.filterMatch = own ? "true" : "false";
+      node.dataset.filterMatch = own ? "true" : "false";
 
       if (node.dataset.root === "true") {
         const batchCheck = node.querySelector(
@@ -3989,7 +3994,8 @@ __DASHBOARD_CSS__
       .forEach((check) => (check.checked = false));
     document
       .querySelectorAll(
-        '.node[data-root="true"][data-filter-match="true"]:not(.hidden) > .node-row .batch-check',      )
+        '.node[data-root="true"][data-filter-match="true"]:not(.hidden) > .node-row .batch-check',
+      )
       .forEach((check) => (check.checked = true));
   };
   document.getElementById("clearBatch").onclick = () => {
@@ -4151,6 +4157,7 @@ __DASHBOARD_CSS__
         lambda match: replacements[match.group(0)],
         template,
     )
+
 
 def normalize_job_request(
     body: dict[str, Any], available_guids: Iterable[str]
